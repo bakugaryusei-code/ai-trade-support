@@ -59,3 +59,9 @@ data/trade_local.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+
+# ─────────────────────────────────────────
+# 開発用の一時出力（検証スクリプトのリダイレクト先など）
+# ─────────────────────────────────────────
+inspect_output.txt
+*.tmp.txt

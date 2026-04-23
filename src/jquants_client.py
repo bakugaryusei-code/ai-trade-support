@@ -6,40 +6,86 @@ V1 の refresh_token → id_token 変換フローは V2 では不要（廃止）
 レスポンスは統一形式：
   {"data": [...], "pagination_key": "..."}
 
-無料プランはレートリミット 5 req/分・データ 12週間遅延に注意。
+プラン別レートリミット（5〜500 req/分）を自動で守る。
+無料プランはデータ 12週間遅延あり。
 """
 from __future__ import annotations
 
 import logging
+import time
+from collections import deque
 from datetime import date, timedelta
 from typing import Any
 
 import requests
 
-from src.config import JQUANTS_BASE_URL
+from src.config import JQUANTS_BASE_URL, JQUANTS_RATE_LIMIT_PER_MIN
 from src.secrets_loader import get_secret
 
 logger = logging.getLogger(__name__)
 
 
 class JQuantsClient:
-    """J-Quants API V2 の軽量クライアント。
+    """J-Quants API V2 の軽量クライアント（レートリミット自動調整つき）。
 
     Example:
-        client = JQuantsClient()
-        stocks = client.get_listed_info(code="7203")      # トヨタ自動車
-        quotes = client.get_daily_quotes(code="7203")
-        summary = client.get_financial_summary(code="7203")
+        client = JQuantsClient()                  # デフォルトは Free プラン
+        client = JQuantsClient(plan="Light")      # Light 契約時
+        stocks = client.get_listed_info(code="7203")
     """
 
-    def __init__(self, api_key: str | None = None) -> None:
+    # J-Quants 側のカウント誤差を吸収するバッファ（秒）
+    _WINDOW_SEC = 60.0
+    _WINDOW_BUFFER_SEC = 5.0
+    _MIN_INTERVAL_BUFFER_SEC = 2.0  # バースト防止用の追加バッファ
+
+    def __init__(self, api_key: str | None = None, plan: str = "Free") -> None:
         self._api_key = api_key or get_secret("JQUANTS_API_KEY")
+        self._rate_limit = JQUANTS_RATE_LIMIT_PER_MIN.get(plan, 5)
+        # コール間の最小間隔（秒）。バーストを防ぎ均等配分する。
+        self._min_interval = (60.0 / self._rate_limit) + self._MIN_INTERVAL_BUFFER_SEC
+        self._last_call_time = 0.0
+        # 直近 (60+buffer) 秒間のAPI呼び出し時刻を保持
+        self._call_times: deque[float] = deque()
+
+    def _throttle(self) -> None:
+        """2段階のレートリミッタ。
+
+        1. **最小間隔**：前回コールから最低 self._min_interval 秒空ける（バースト防止）
+        2. **スライディングウィンドウ**：直近 (60+buffer) 秒間の呼び出し数を rate_limit 以下に保つ
+        両方の条件を満たすまで待機する。
+        """
+        window = self._WINDOW_SEC + self._WINDOW_BUFFER_SEC
+
+        # ── 1. 最小間隔チェック（バースト防止） ──
+        elapsed = time.time() - self._last_call_time
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
+
+        # ── 2. スライディングウィンドウチェック ──
+        now = time.time()
+        while self._call_times and now - self._call_times[0] > window:
+            self._call_times.popleft()
+
+        if len(self._call_times) >= self._rate_limit:
+            oldest = self._call_times[0]
+            wait_for = (oldest + window) - now
+            if wait_for > 0:
+                time.sleep(wait_for)
+            now = time.time()
+            while self._call_times and now - self._call_times[0] > window:
+                self._call_times.popleft()
+
+        call_time = time.time()
+        self._last_call_time = call_time
+        self._call_times.append(call_time)
 
     def _headers(self) -> dict[str, str]:
         return {"x-api-key": self._api_key}
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """V2認証付きGETリクエスト（1回のみ）。"""
+        """V2認証付きGETリクエスト（レートリミット遵守つき）。"""
+        self._throttle()
         url = f"{JQUANTS_BASE_URL}{path}"
         response = requests.get(url, headers=self._headers(), params=params, timeout=30)
         response.raise_for_status()
@@ -65,11 +111,10 @@ class JQuantsClient:
     def get_listed_info(self, code: str | None = None) -> list[dict[str, Any]]:
         """上場銘柄一覧を取得（V2: /equities/master）。
 
-        Args:
-            code: 指定すればその1銘柄のみ。省略時は全銘柄（約4,000件）。
-
         Returns:
-            銘柄情報のリスト。Code / CompanyName / MarketCode / Sector17Code など。
+            銘柄情報のリスト。主要フィールド：
+              Code / CoName / CoNameEn / Mkt / MktNm /
+              S17 / S17Nm / S33 / S33Nm / ScaleCat / Mrgn / MrgnNm
         """
         params = {"code": code} if code else None
         return self._get_all("/equities/master", params)
@@ -82,15 +127,9 @@ class JQuantsClient:
     ) -> list[dict[str, Any]]:
         """指定銘柄の日次株価を取得（V2: /equities/bars/daily）。
 
-        Args:
-            code: 銘柄コード（例: "7203"）。
-            from_date: 開始日（省略時は30日前）。
-            to_date: 終了日（省略時は今日）。
-
-        Returns:
-            日次株価のリスト。V2のカラム名は短縮形：
-              Date / Code / O(始値) / H(高値) / L(安値) / C(終値) /
-              Vo(出来高) / Va(売買代金) / AdjC(調整後終値) など。
+        V2 のカラム名は短縮形：
+          Date / Code / O(始値) / H(高値) / L(安値) / C(終値) /
+          Vo(出来高) / Va(売買代金) / AdjC(調整後終値) など。
         """
         if to_date is None:
             to_date = date.today()
@@ -105,9 +144,12 @@ class JQuantsClient:
         return self._get_all("/equities/bars/daily", params)
 
     def get_financial_summary(self, code: str) -> list[dict[str, Any]]:
-        """財務サマリーを取得（V2: /fins/summary、旧 /v1/fins/statements 相当）。
+        """財務サマリーを取得（V2: /fins/summary）。
 
-        黒字判定・時価総額推定・決算タイミングの把握に使う。
+        主要フィールド：
+          DiscDate / Code / DocType / CurFYEn /
+          Sales / OP / NP(純利益) / EPS / TA / Eq / EqAR /
+          FNP(予想純利益) / ShOutFY(期末発行済株式数) など。
         """
         params = {"code": code}
         return self._get_all("/fins/summary", params)
