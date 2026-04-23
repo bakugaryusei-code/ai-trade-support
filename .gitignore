@@ -65,3 +65,4 @@ data/*.db-shm
 # ─────────────────────────────────────────
 inspect_output.txt
 *.tmp.txt
+data/trade.db 
