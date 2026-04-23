@@ -5,8 +5,7 @@
   - センター寄せ単一カラム
   - タブで4セクション切り替え（推奨 / 保有 / 記録 / 成績）
 
-Step 5 時点ではサンプルデータ（src.mock_data）で動作。
-Step 6 完了時に SQLite 経由のデータアクセスに差し替える。
+データは SQLite（src.db）で永続化。DB が空のときは src.mock_data から初期投入。
 """
 from __future__ import annotations
 
@@ -14,7 +13,7 @@ from datetime import date, datetime
 
 import streamlit as st
 
-from src import mock_data
+from src import db
 
 # ─────────────────────────────────────────
 # ページ設定
@@ -45,13 +44,11 @@ st.markdown(
 
 
 # ─────────────────────────────────────────
-# session_state 初期化（Step 6 で SQLite に差し替え）
+# DB 初期化（テーブル作成 + 初回はシード）
 # ─────────────────────────────────────────
 
-if "trades" not in st.session_state:
-    st.session_state.trades = []      # 取引履歴
-if "holdings" not in st.session_state:
-    st.session_state.holdings = {}    # code -> {shares, avg_cost, name}
+db.init_db()
+db.seed_if_empty()
 
 
 # ─────────────────────────────────────────
@@ -78,34 +75,6 @@ def _format_yen(yen: float | int | None) -> str:
     return f"{yen:,.0f}円"
 
 
-def _recompute_holdings_from_trades() -> None:
-    """trades から holdings を再構築（買い増し・売却を反映）。"""
-    holdings: dict[str, dict] = {}
-    for t in st.session_state.trades:
-        code = t["code"]
-        if code not in holdings:
-            holdings[code] = {"shares": 0, "total_cost": 0.0, "name": t.get("name", "")}
-        if t["side"] == "buy":
-            holdings[code]["shares"] += t["shares"]
-            holdings[code]["total_cost"] += t["shares"] * t["price"]
-        else:  # sell
-            if holdings[code]["shares"] > 0:
-                avg = holdings[code]["total_cost"] / holdings[code]["shares"]
-                holdings[code]["shares"] -= t["shares"]
-                holdings[code]["total_cost"] -= t["shares"] * avg
-        if holdings[code]["shares"] <= 0:
-            holdings.pop(code, None)
-    # 平均取得単価を計算して保存
-    result = {}
-    for code, h in holdings.items():
-        result[code] = {
-            "shares": h["shares"],
-            "avg_cost": h["total_cost"] / h["shares"] if h["shares"] > 0 else 0,
-            "name": h["name"],
-        }
-    st.session_state.holdings = result
-
-
 # ─────────────────────────────────────────
 # ヘッダー
 # ─────────────────────────────────────────
@@ -129,18 +98,22 @@ tab_reco, tab_hold, tab_log, tab_stat = st.tabs(
 
 # ───── 🎯 推奨タブ ─────────────────────
 with tab_reco:
-    overview = mock_data.get_latest_market_overview()
+    overview = db.get_latest_market_overview()
 
     with st.expander("🌏 今日の市場概況", expanded=True):
-        st.markdown(overview["summary"])
-        st.caption(
-            f"更新: {overview['updated_at']}｜"
-            f"Web検索 {overview['search_count']}件 / 引用 {overview['citation_count']}件"
-        )
+        if overview:
+            st.markdown(overview["summary"])
+            st.caption(
+                f"更新: {overview.get('updated_at', '')}｜"
+                f"Web検索 {overview.get('search_count', 0)}件 / "
+                f"引用 {overview.get('citation_count', 0)}件"
+            )
+        else:
+            st.info("市場概況はまだ取得されていません（次の朝のバッチ 8時 で生成されます）。")
 
     st.subheader("🎯 今日のAI推奨")
 
-    recs = mock_data.get_todays_recommendations()
+    recs = db.get_todays_recommendations()
     if not recs:
         st.info("現在の推奨銘柄はありません。次のバッチ（12時）をお待ちください。")
 
@@ -181,24 +154,23 @@ with tab_reco:
 
 # ───── 📊 保有タブ ─────────────────────
 with tab_hold:
-    _recompute_holdings_from_trades()
-
     st.subheader("📊 保有銘柄")
 
-    if not st.session_state.holdings:
+    holdings = db.get_holdings()
+    if not holdings:
         st.info(
             "現在、保有銘柄はありません。\n\n"
             "買い注文したら「📝 記録」タブから取引を記録してください。"
         )
     else:
-        for code, h in st.session_state.holdings.items():
+        for h in holdings:
             with st.container(border=True):
-                st.markdown(f"### {code} {h['name']}")
+                st.markdown(f"### {h['code']} {h['name']}")
                 col1, col2 = st.columns(2)
                 col1.metric("保有株数", f"{h['shares']}株")
                 col2.metric("平均取得単価", f"{h['avg_cost']:,.0f}円")
                 st.caption(
-                    "含み損益は現在値取得のインフラ実装後に表示されます（Step 6以降）"
+                    "含み損益は現在値取得のインフラ実装後に表示されます（運用開始時に対応）"
                 )
 
 
@@ -214,7 +186,12 @@ with tab_log:
     if "_pending_trade_msg" in st.session_state:
         st.success(st.session_state.pop("_pending_trade_msg"))
 
-    with st.form("trade_form", clear_on_submit=True):
+    # フォームバージョン（成功時に +1 することで次の描画を空フォーム化）
+    if "trade_form_v" not in st.session_state:
+        st.session_state.trade_form_v = 0
+    _v = st.session_state.trade_form_v
+
+    with st.form(f"trade_form_v{_v}", clear_on_submit=False):
         side = st.radio("種別", ["buy", "sell"], horizontal=True,
                         format_func=lambda x: "🟢 買い" if x == "buy" else "🔴 売り")
         col1, col2 = st.columns(2)
@@ -244,6 +221,7 @@ with tab_log:
         st.caption(
             "※ 全項目（*）の入力後、必ず「記録する」ボタンをクリックしてください。"
             " Enterキーだけでは未入力項目のエラー表示になります。"
+            " エラー時は入力値が保持されるので、足りない項目だけ埋めて再送信できます。"
         )
 
         submitted = st.form_submit_button("記録する", type="primary")
@@ -262,8 +240,9 @@ with tab_log:
             if errors:
                 for err in errors:
                     st.error(err)
+                # バージョン据え置き → 同じフォーム扱い → 入力値が保持される
             else:
-                st.session_state.trades.append({
+                db.save_trade({
                     "side": side,
                     "code": code.strip(),
                     "name": name.strip(),
@@ -277,43 +256,109 @@ with tab_log:
                     f"{int(shares)}株 × {float(price):,.0f}円 を記録しました。"
                     " 📊 保有タブで残高を確認できます。"
                 )
-                # 保有タブの再計算が反映されるよう再描画
+                # バージョン +1 で次回は新しいフォームキー → 自動で空フォームに
+                st.session_state.trade_form_v += 1
                 st.rerun()
 
     st.divider()
     st.subheader("📜 取引履歴")
-    if not st.session_state.trades:
+    trades = db.get_trade_history()
+    if not trades:
         st.caption("まだ取引履歴はありません。")
     else:
-        for t in reversed(st.session_state.trades):
+        for t in trades:
             emoji = "🟢" if t["side"] == "buy" else "🔴"
-            st.markdown(
-                f"- {emoji} **{t['date']}** {t['code']} {t['name']} "
-                f"{t['shares']}株 × {t['price']:,.0f}円"
+            c_text, c_btn = st.columns([5, 1])
+            with c_text:
+                st.markdown(
+                    f"{emoji} **{t['trade_date']}** {t['code']} {t.get('name', '')} "
+                    f"{t['shares']}株 × {t['price']:,.0f}円"
+                )
+            with c_btn:
+                if st.button("🗑️", key=f"del_trade_{t['id']}", help="この記録を削除"):
+                    db.delete_trade(t["id"])
+                    st.session_state["_pending_trade_msg"] = (
+                        f"取引を削除しました: {t['code']} {t['shares']}株 × "
+                        f"{t['price']:,.0f}円（{t['trade_date']}）"
+                    )
+                    st.rerun()
+
+        # ── 危険ゾーン：全削除 ──────────────────
+        with st.expander("⚠️ 危険ゾーン：取引履歴を全削除"):
+            st.caption(
+                "テストデータの一括クリアや、SBI連動の手動入力をやり直したいときに使います。"
+                " 削除した取引は復元できません。"
             )
+            confirm = st.checkbox(
+                "本当に全件削除することを理解しました",
+                key="confirm_clear_trades",
+            )
+            disabled = not confirm
+            if st.button(
+                "🗑️ 全取引履歴を削除",
+                type="secondary",
+                disabled=disabled,
+                key="btn_clear_trades",
+            ):
+                deleted = db.clear_all_trades()
+                st.session_state["_pending_trade_msg"] = (
+                    f"🗑️ 取引履歴を全削除しました（{deleted}件）"
+                )
+                st.rerun()
 
 
 # ───── 📈 成績タブ ─────────────────────
 with tab_stat:
-    stats = mock_data.get_performance_stats()
+    st.subheader("💰 実現損益（あなたの売買成績）")
 
-    st.subheader("📈 AI推奨の成績")
-
-    if not stats["total_recommendations"]:
-        st.info(
-            "データ蓄積中です。1〜2週間運用後に勝率・平均リターン等が表示されます。"
+    pl = db.get_realized_profit_summary()
+    if pl["sell_count"] == 0:
+        st.info("売却がまだないため、実現損益は未計上です。")
+    else:
+        c1, c2 = st.columns(2)
+        total_pl = pl["total_realized_pl"]
+        c1.metric(
+            "実現損益（累計）",
+            f"{total_pl:+,.0f}円",
+            delta=f"{total_pl:+,.0f}" if total_pl else None,
         )
+        c2.metric("売却回数", f"{pl['sell_count']}回")
+
+        if pl["by_code"]:
+            st.markdown("**銘柄別の実現損益**")
+            for item in pl["by_code"]:
+                sign = "🟢" if item["realized_pl"] > 0 else "🔴"
+                st.markdown(
+                    f"- {sign} **{item['code']} {item['name']}**: "
+                    f"{item['realized_pl']:+,.0f}円"
+                )
+
+    st.divider()
+    st.subheader("🤖 AI推奨の成績")
+
+    stats = db.get_performance_stats()
+    if not stats["total_recommendations"]:
+        st.info("データ蓄積中です。1〜2週間の運用後に勝率・平均リターンが表示されます。")
     else:
         col1, col2 = st.columns(2)
         col1.metric("累計推奨", f"{stats['total_recommendations']}件")
-        col2.metric("勝率", f"{stats['win_rate_pct']:.0f}%" if stats['win_rate_pct'] is not None else "—")
+        col2.metric(
+            "勝率",
+            f"{stats['win_rate_pct']:.0f}%" if stats["win_rate_pct"] is not None else "—",
+        )
         col3, col4 = st.columns(2)
-        col3.metric("平均リターン", f"{stats['avg_return_pct']:+.2f}%" if stats['avg_return_pct'] is not None else "—")
-        col4.metric("最大ドローダウン", f"{stats['max_drawdown_pct']:.2f}%" if stats['max_drawdown_pct'] is not None else "—")
+        col3.metric(
+            "平均リターン",
+            f"{stats['avg_return_pct']:+.2f}%" if stats["avg_return_pct"] is not None else "—",
+        )
+        col4.metric(
+            "最大ドローダウン",
+            f"{stats['max_drawdown_pct']:.2f}%" if stats["max_drawdown_pct"] is not None else "—",
+        )
         st.caption(f"集計期間: 直近{stats['period_days']}日")
 
     st.divider()
     st.caption(
         "※ 月次で Claude が過去の推奨を振り返り、"
-        "reflections/YYYY-MM.md にレポートを残します（Step 6以降）"
+        "`reflections/YYYY-MM.md` にレポートを残します（運用開始後に実装予定）。"
     )
