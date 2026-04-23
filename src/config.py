@@ -43,4 +43,11 @@ DB_PATH: str = "data/trade.db"
 # ─────────────────────────────────────────
 # J-Quants APIエンドポイント
 # ─────────────────────────────────────────
-JQUANTS_BASE_URL: str = "https://api.jquants.com/v1"
+JQUANTS_BASE_URL: str = "https://api.jquants.com/v2"
+
+JQUANTS_RATE_LIMIT_PER_MIN: dict[str, int] = {
+    "Free": 5,
+    "Light": 60,
+    "Standard": 120,
+    "Premium": 500,
+}
