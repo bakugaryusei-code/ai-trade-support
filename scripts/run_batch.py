@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import sys
 import traceback
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
 # Windows + cmd で `>` リダイレクト時の UnicodeEncodeError 回避
@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src import db
 from src.ai_analyzer import AIAnalyzer
+from src.jquants_client import JQuantsClient
 from src.screening import Screener
 
 logger = logging.getLogger(__name__)
@@ -35,9 +36,13 @@ logger = logging.getLogger(__name__)
 # 設定（レートリミットとコスト抑制のため慎重に）
 # ─────────────────────────────────────────
 
-# Free プラン対応：スクリーニングで処理する銘柄上限
-SCREENING_LIMIT = 5
-# Tier A から詳細分析する上限（コスト抑制）
+# J-Quants プラン名（"Free" / "Light" / "Standard" / "Premium"）。
+# Light 以上では直近のデータが取れるので過去日指定の workaround は不要。
+JQUANTS_PLAN = "Light"
+
+# スクリーニングで処理する銘柄上限。Light（60/分）なら15〜20でも数分で完了。
+SCREENING_LIMIT = 10
+# Tier A から詳細分析する上限（仕様書設計⑤の運用範囲）
 DETAILED_ANALYSIS_LIMIT = 3
 
 
@@ -73,9 +78,9 @@ def main() -> None:
     db.init_db()
 
     # ─── 1. スクリーニング（API呼び出しあり、時間がかかる） ───
-    print("\n📋 Step 1: スクリーニング実行中...")
+    print(f"\n📋 Step 1: スクリーニング実行中（J-Quants {JQUANTS_PLAN} プラン）...")
     try:
-        screener = Screener()
+        screener = Screener(client=JQuantsClient(plan=JQUANTS_PLAN))
         candidates = screener.run(limit=SCREENING_LIMIT)
         print(f"✅ 候補銘柄: {len(candidates)}件")
         db.save_candidates(batch_date, candidates)
