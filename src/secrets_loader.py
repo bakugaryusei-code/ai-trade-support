@@ -15,7 +15,13 @@ from pathlib import Path
 
 
 _SECRETS_FILE = Path(".streamlit/secrets.toml")
-_ENV_KEYS = ("JQUANTS_API_KEY", "ANTHROPIC_API_KEY")
+_ENV_KEYS = (
+    "JQUANTS_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+    "SUPABASE_SERVICE",
+)
 
 
 def load_secrets() -> dict[str, str]:
