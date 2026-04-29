@@ -44,6 +44,9 @@ JQUANTS_PLAN = "Light"
 SCREENING_LIMIT = 10
 # Tier A から詳細分析する上限（仕様書設計⑤の運用範囲）
 DETAILED_ANALYSIS_LIMIT = 3
+# 市場概況の最低更新間隔（時間）。GitHub Actions の遅延を吸収するため、
+# 「朝のみ実行」ではなく「前回から N時間以上経過していれば更新」とする。
+MARKET_OVERVIEW_REFRESH_HOURS = 4
 
 
 def _jst_now() -> datetime:
@@ -51,9 +54,35 @@ def _jst_now() -> datetime:
     return datetime.now(timezone(timedelta(hours=9)))
 
 
-def _is_morning_batch(now: datetime) -> bool:
-    """朝のバッチかどうか（6時〜10時の範囲）。市場概況はここでのみ実行。"""
-    return 6 <= now.hour <= 10
+def _should_refresh_market_overview(now: datetime) -> bool:
+    """市場概況を再取得すべきかを判定。
+
+    GitHub Actions の遅延で「朝のみ実行」が機能しない事象を回避するため、
+    時刻ベースではなく「前回更新からの経過時間」で判定する。
+    """
+    latest = db.get_latest_market_overview()
+    if not latest:
+        return True  # 初回は必ず取得
+
+    last_dt_str = latest.get("batch_datetime") or latest.get("created_at", "")
+    if not last_dt_str:
+        return True
+
+    # YYYY-MM-DD HH:MM 形式 or YYYY-MM-DDTHH:MM:SS形式に対応
+    try:
+        # 簡易パース：先頭16文字（YYYY-MM-DD HH:MM）を見る
+        last_dt = datetime.strptime(last_dt_str[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        try:
+            last_dt = datetime.fromisoformat(last_dt_str.replace("Z", "+00:00"))
+            last_dt = last_dt.replace(tzinfo=None)
+        except Exception:
+            return True  # パース失敗時は念のため更新
+
+    # JST naive 同士で比較
+    now_naive = now.replace(tzinfo=None)
+    elapsed = (now_naive - last_dt).total_seconds() / 3600
+    return elapsed >= MARKET_OVERVIEW_REFRESH_HOURS
 
 
 def main() -> None:
@@ -66,12 +95,10 @@ def main() -> None:
     now = _jst_now()
     batch_dt = now.strftime("%Y-%m-%d %H:%M")
     batch_date = now.strftime("%Y-%m-%d")
-    is_morning = _is_morning_batch(now)
 
     print("=" * 60)
     print(f"🤖 AIトレードサポート バッチ実行")
     print(f"   JST: {batch_dt}")
-    print(f"   朝のバッチ: {is_morning}")
     print("=" * 60)
 
     # ─── DB 初期化（ファイルが無ければ作成） ───
@@ -93,11 +120,12 @@ def main() -> None:
     if not candidates:
         print("⚠️  候補ゼロのため、Tier分類・詳細分析はスキップ")
 
-    # ─── 2. 市場概況（朝のみ） ───
+    # ─── 2. 市場概況（時間ベースで判定：前回更新から N時間経過） ───
     analyzer = AIAnalyzer()
     overview = None
-    if is_morning:
-        print("\n🌏 Step 0: 市場概況スキャン（Sonnet + Web検索）...")
+    should_refresh = _should_refresh_market_overview(now)
+    if should_refresh:
+        print(f"\n🌏 Step 0: 市場概況スキャン（前回から {MARKET_OVERVIEW_REFRESH_HOURS}時間以上経過 → 更新）...")
         try:
             ov = analyzer.run_market_overview()
             db.save_market_overview({
@@ -112,7 +140,8 @@ def main() -> None:
             print(f"⚠️ 市場概況取得失敗（続行）: {e}")
             traceback.print_exc()
     else:
-        # 朝以外は最新の市場概況を DB から読み込む
+        print(f"\n🌏 Step 0: 市場概況は最新（前回更新から {MARKET_OVERVIEW_REFRESH_HOURS}時間未満）→ スキップ")
+        # 既存の最新市場概況を DB から読み込む
         latest = db.get_latest_market_overview()
         if latest:
             from src.ai_analyzer import MarketOverview as MO
