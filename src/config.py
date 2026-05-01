@@ -12,6 +12,16 @@ SCREENING_MARKET: str = "PRIME"
 MIN_MARKET_CAP_YEN: int = 50_000_000_000
 REQUIRE_PROFIT: bool = True
 
+# ScaleCat ホワイトリスト（TOPIX 500 = Core30 + Large70 + Mid400）。
+# プライム約1,575社のうち約493社に絞ることで、業種偏在なく時価総額500億+
+# 黒字フィルタが意味を持つ母集団になる。
+# ※ 表記揺れに注意："TOPIX Mid400"（スペース無）・"TOPIX Small 1/2"（スペース有）。
+SCALE_CATEGORY_FILTER: tuple[str, ...] = (
+    "TOPIX Core30",
+    "TOPIX Large70",
+    "TOPIX Mid400",
+)
+
 PRIMARY_CANDIDATES_LIMIT: int = 40
 TIER_A_MAX_DETAILED_ANALYSIS: int = 5
 

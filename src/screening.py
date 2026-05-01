@@ -54,6 +54,31 @@ def filter_by_market(
     return [s for s in stocks if s.get("Mkt") == target_code]
 
 
+def filter_by_scale_category(
+    stocks: list[dict[str, Any]],
+    categories: tuple[str, ...] | list[str],
+) -> list[dict[str, Any]]:
+    """ScaleCat ホワイトリストで銘柄を絞り込む。
+
+    /equities/master のレスポンスに含まれる ScaleCat フィールドの値を
+    ホワイトリスト方式で照合し、一致する銘柄のみを返す。
+
+    主な用途：プライム市場約1,575社から TOPIX 500（Core30+Large70+Mid400）の
+    493社に絞ることで、時価総額・業種分散の点で「絞り込み」が機能する母集団
+    にする。
+
+    Args:
+        stocks: get_listed_info() の返値、または filter_by_market 後のリスト。
+        categories: 通すべき ScaleCat 値のタプル/リスト。
+                   表記揺れに注意（"TOPIX Mid400" 等の固定文字列で完全一致）。
+
+    Returns:
+        ScaleCat がホワイトリストに含まれる銘柄のみ。
+    """
+    allowed = set(categories)
+    return [s for s in stocks if s.get("ScaleCat") in allowed]
+
+
 def is_profitable(financial_summary: list[dict[str, Any]]) -> bool:
     """直近の財務サマリーから黒字かどうかを判定。
 

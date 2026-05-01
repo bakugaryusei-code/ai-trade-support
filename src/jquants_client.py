@@ -143,6 +143,28 @@ class JQuantsClient:
         }
         return self._get_all("/equities/bars/daily", params)
 
+    def get_daily_quotes_by_date(
+        self,
+        target_date: date,
+    ) -> list[dict[str, Any]]:
+        """指定日の **全上場銘柄** の日次株価を一括取得（V2: /equities/bars/daily）。
+
+        V2 ドキュメントによれば、`/equities/bars/daily` は `code` または `date` の
+        どちらかが必須で、`date` 単独指定時は全上場銘柄のデータが返る。
+        pagination_key で複数ページに分割されるため `_get_all` で結合する。
+
+        ※ 営業日でない日付（週末・祝日）を指定すると空配列が返る。
+          呼び出し側で直近営業日まで遡る等のリトライ制御が必要。
+
+        Args:
+            target_date: 取得対象の日付。
+
+        Returns:
+            その日の全銘柄の株価データ。フィールドは get_daily_quotes と同じ。
+        """
+        params = {"date": target_date.strftime("%Y-%m-%d")}
+        return self._get_all("/equities/bars/daily", params)
+
     def get_financial_summary(self, code: str) -> list[dict[str, Any]]:
         """財務サマリーを取得（V2: /fins/summary）。
 
