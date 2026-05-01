@@ -113,9 +113,21 @@ with tab_reco:
 
     st.subheader("🎯 今日のAI推奨")
 
-    recs = db.get_todays_recommendations()
+    # 推奨枠は Tier A（Claude Sonnet が Web検索付きで詳細分析した銘柄）のみ表示。
+    # Tier B/C も Supabase には保存されているが、根拠は Haiku の30字理由のみで
+    # 詳細分析を経ていないため、推奨枠に並べるとミスリーディング。
+    # Tier B/C の一覧表示が必要になったら別タブ・別画面で扱う方針（別件）。
+    all_recs = db.get_todays_recommendations()
+    recs = [r for r in all_recs if r.get("tier") == "A"]
+
     if not recs:
-        st.info("現在の推奨銘柄はありません。次のバッチ（12時）をお待ちください。")
+        if all_recs:
+            st.info(
+                f"今日のバッチでは Tier A（詳細分析対象）に該当する銘柄がありませんでした。"
+                f"（候補のスクリーニング結果は {len(all_recs)} 件あります。）"
+            )
+        else:
+            st.info("現在の推奨銘柄はありません。次のバッチ（12時）をお待ちください。")
 
     for rec in recs:
         with st.container(border=True):
