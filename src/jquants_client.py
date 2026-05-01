@@ -37,7 +37,14 @@ class JQuantsClient:
     # J-Quants 側のカウント誤差を吸収するバッファ（秒）
     _WINDOW_SEC = 60.0
     _WINDOW_BUFFER_SEC = 5.0
-    _MIN_INTERVAL_BUFFER_SEC = 2.0  # バースト防止用の追加バッファ
+    # コール間最小間隔への上乗せバッファ（秒）。
+    # スライディングウィンドウ（_WINDOW_SEC + _WINDOW_BUFFER_SEC = 65秒に
+    # rate_limit 件まで）が既に rate_limit×60/65 ≒ 92% の上限を作っているため、
+    # 追加バッファは「ネットワーク遅延ゆらぎでサーバ側のカウントが分跨ぎする」
+    # 程度の安全マージンで十分。0.2秒なら全プランで rate_limit の 80〜92% を出せる。
+    # 旧値 2.0 は Free プラン（5/分=12秒/コール）想定で過大、Light（1秒/コール）
+    # では実効レートを 1/3 に絞り込んでいた。
+    _MIN_INTERVAL_BUFFER_SEC = 0.2
 
     def __init__(self, api_key: str | None = None, plan: str = "Free") -> None:
         self._api_key = api_key or get_secret("JQUANTS_API_KEY")
