@@ -1,15 +1,15 @@
-"""GitHub Actions から呼び出されるバッチ起動スクリプト。
+"""GitHub Actions / cron-job.org から呼び出されるバッチ起動スクリプト。
 
 JST 8時/12時/15時に定期実行され、以下を行う：
   1. Pythonスクリーニング（少数候補に絞る）
-  2. 市場概況スキャン（Sonnet + Web検索、朝のみ）
+  2. 市場概況スキャン（Sonnet + Web検索、前回から4時間以上経過時のみ更新）
   3. Haikuバッチ評価で Tier 分類
-  4. Sonnet詳細分析（Tier A 上位を対象）
-  5. 結果を SQLite に保存
-  6. （workflow 側で）data/trade.db を commit して GitHub に push
+  4. Sonnet詳細分析（Tier A 上位3件を対象）
+  5. 結果を Supabase（PostgreSQL）に保存
+     ※ Phase 2 で SQLite から Supabase に移行済み。trade.db の commit/push は廃止。
 
 コスト目安：1回あたり $0.15〜0.30（月 $15〜27）
-Free プランの J-Quants レートリミット（5/分）に対応するため、候補数は少なめに制限。
+J-Quants Light プラン（60/分）使用。Free 時代の対応で候補数は少なめに制限。
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src import db
 from src.ai_analyzer import AIAnalyzer
+from src.config import SCALE_CATEGORY_FILTER, SCREENING_MARKET
 from src.jquants_client import JQuantsClient
 from src.screening import Screener
 
@@ -40,8 +41,6 @@ logger = logging.getLogger(__name__)
 # Light 以上では直近のデータが取れるので過去日指定の workaround は不要。
 JQUANTS_PLAN = "Light"
 
-# スクリーニングで処理する銘柄上限。Light（60/分）なら15〜20でも数分で完了。
-SCREENING_LIMIT = 10
 # Tier A から詳細分析する上限（仕様書設計⑤の運用範囲）
 DETAILED_ANALYSIS_LIMIT = 3
 # 市場概況の最低更新間隔（時間）。GitHub Actions の遅延を吸収するため、
@@ -104,11 +103,18 @@ def main() -> None:
     # ─── DB 初期化（ファイルが無ければ作成） ───
     db.init_db()
 
-    # ─── 1. スクリーニング（API呼び出しあり、時間がかかる） ───
+    # ─── 1. スクリーニング（API呼び出しあり、Light プランで約9分） ───
+    # 母集団: プライム × ScaleCat ホワイトリスト（TOPIX 500 = 約493社）。
+    # 株価は /equities/bars/daily?date=... で全銘柄を一括取得し、
+    # 各銘柄では fins/summary 1コールのみ。
     print(f"\n📋 Step 1: スクリーニング実行中（J-Quants {JQUANTS_PLAN} プラン）...")
+    print(f"   対象: {SCREENING_MARKET} × {SCALE_CATEGORY_FILTER}")
     try:
         screener = Screener(client=JQuantsClient(plan=JQUANTS_PLAN))
-        candidates = screener.run(limit=SCREENING_LIMIT)
+        candidates = screener.run(
+            market=SCREENING_MARKET,
+            scale_categories=SCALE_CATEGORY_FILTER,
+        )
         print(f"✅ 候補銘柄: {len(candidates)}件")
         db.save_candidates(batch_date, candidates)
     except Exception as e:
