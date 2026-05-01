@@ -142,10 +142,14 @@ class AIAnalyzer:
             "すべての候補銘柄に対して必ず1要素返すこと。"
         )
 
+        # Haiku 4.5 の上限は 64,000 トークン（公式仕様）。
+        # TOPIX 500 を全件絞り込んだ後の候補（最大493件）をすべて分類するため、
+        # 1要素あたり ~70トークン × 500件 ≈ 35,000トークンの出力余地が必要。
+        # 旧値 2,048 では 404件入力時に途中で切れて JSON 抽出失敗していた。
         reply = self._client.ask(
             prompt,
             heavy=False,  # Haiku
-            max_tokens=2048,
+            max_tokens=32000,
         )
 
         tier_data = self._extract_json_array(reply)
