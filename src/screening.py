@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from src.config import (
@@ -134,6 +134,30 @@ def _extract_latest_close(quotes: list[dict[str, Any]]) -> float | None:
     return None
 
 
+def _build_close_map(quotes: list[dict[str, Any]]) -> dict[str, float]:
+    """全銘柄単日株価リストから {正規化4桁コード: 終値} を構築。
+
+    終値は AdjC（調整後終値）優先、無ければ C（終値）。
+    レスポンスの Code が 5桁（末尾0付）の場合は normalize_code で4桁に揃える。
+    """
+    result: dict[str, float] = {}
+    for q in quotes:
+        code = q.get("Code", "")
+        if not code:
+            continue
+        normalized = normalize_code(code)
+        for field in ("AdjC", "C"):
+            v = q.get(field)
+            if v in (None, ""):
+                continue
+            try:
+                result[normalized] = float(v)
+                break
+            except (ValueError, TypeError):
+                continue
+    return result
+
+
 class Screener:
     """スクリーニング全体のオーケストレーター。"""
 
@@ -151,24 +175,34 @@ class Screener:
     def evaluate_stock(
         self,
         code: str,
+        latest_close: float | None = None,
         quote_from_date: "date | None" = None,
         quote_to_date: "date | None" = None,
     ) -> dict[str, Any]:
-        """1銘柄の黒字フラグ・時価総額・直近終値を算出（API 2コール）。
+        """1銘柄の黒字フラグ・時価総額・直近終値を算出。
 
         Args:
+            latest_close: 事前取得済みの終値。指定された場合は株価APIを呼ばず
+                これを使う（一括取得 → per-banking 集計の高速パス）。
+                None の場合は従来通り get_daily_quotes で取得（テスト・Freeプラン用）。
             quote_from_date / quote_to_date:
-                株価取得の日付範囲。省略時はクライアントデフォルト（直近30日）。
+                latest_close=None の時のみ有効。株価取得の日付範囲。
                 Free プランはデータ 12週間遅延のため、古めの日付を指定すると良い。
+
+        API コール数：
+            - latest_close 指定あり: 1コール（fins/summary のみ）
+            - latest_close 指定なし: 2コール（fins/summary + bars/daily）
         """
         normalized = normalize_code(code)
         summary = self._client.get_financial_summary(normalized)
-        quotes = self._client.get_daily_quotes(
-            normalized,
-            from_date=quote_from_date,
-            to_date=quote_to_date,
-        )
-        latest_close = _extract_latest_close(quotes)
+
+        if latest_close is None:
+            quotes = self._client.get_daily_quotes(
+                normalized,
+                from_date=quote_from_date,
+                to_date=quote_to_date,
+            )
+            latest_close = _extract_latest_close(quotes)
 
         return {
             "code": normalized,
@@ -179,11 +213,47 @@ class Screener:
             "disclosed_date": summary[0].get("DiscDate") if summary else None,
         }
 
+    def fetch_latest_close_map(
+        self,
+        max_attempts: int = 7,
+    ) -> dict[str, float]:
+        """直近営業日まで遡り、全上場銘柄の終値マップを一括取得。
+
+        /equities/bars/daily?date=YYYY-MM-DD は date 単独指定で全銘柄分を返す
+        （pagination 込みでも数コール）。指定日が休場・未配信なら前日に遡る。
+
+        Args:
+            max_attempts: 最大何日前まで遡るか（既定7日 ≒ 連休跨ぎを許容）。
+
+        Returns:
+            {正規化4桁コード: 終値} の辞書。終値は AdjC 優先、無ければ C。
+            データが見つからない場合は空辞書。
+        """
+        today = date.today()
+        for delta in range(max_attempts):
+            target = today - timedelta(days=delta)
+            try:
+                quotes = self._client.get_daily_quotes_by_date(target)
+            except Exception as e:
+                logger.warning(f"全銘柄株価取得失敗 ({target}): {e}")
+                continue
+            if not quotes:
+                continue
+            logger.info(
+                f"終値マップ: {target} のデータ {len(quotes)}件を採用"
+            )
+            return _build_close_map(quotes)
+        logger.warning(
+            f"過去{max_attempts}日に営業日データが見つかりませんでした"
+        )
+        return {}
+
     def run(
         self,
         market: str = SCREENING_MARKET,
         min_market_cap_yen: int = MIN_MARKET_CAP_YEN,
         require_profit: bool = REQUIRE_PROFIT,
+        scale_categories: tuple[str, ...] | list[str] | None = None,
         limit: int | None = None,
         quote_from_date: date | None = None,
         quote_to_date: date | None = None,
@@ -194,28 +264,66 @@ class Screener:
             market: 対象市場（"PRIME" / "STANDARD" / "GROWTH" / "ALL"）。
             min_market_cap_yen: 時価総額の下限（円）。
             require_profit: True なら黒字必須。
-            limit: テスト用の件数制限。Free プランでは必ず指定推奨。
+            scale_categories: ScaleCat ホワイトリスト（例: ("TOPIX Core30", ...)）。
+                None なら ScaleCat フィルタなし（市場フィルタのみ）。
+                指定すると、母集団を TOPIX 100/500 などのインデックス構成銘柄に
+                絞った上でスクリーニングする。
+            limit: 件数制限（テスト用）。先頭N件にスライス。
             quote_from_date / quote_to_date: 株価取得の日付範囲。
-                Free プランは最新12週間のデータが取れないので、古い日付を指定推奨。
+                **指定すると per-code モードで動作**（テスト・Free プラン互換）。
+                両方とも None なら **bulk モード**（全銘柄株価を1コールで一括取得）。
 
         Returns:
             条件を満たした銘柄の情報（名称・時価総額・純利益など）。
+
+        高速パスについて:
+            quote_from_date と quote_to_date がどちらも None の場合、株価は
+            fetch_latest_close_map() で全銘柄分を一括取得し、各銘柄の評価では
+            fins/summary 1コールのみ行う。これにより TOPIX 500（493社）でも
+            約500コール = 約9分（Light プラン60/分）で完了する。
+
+            日付範囲が指定された場合は従来の per-code モードとなり、各銘柄で
+            fins/summary + bars/daily の2コールを発行する（テスト互換用）。
         """
         target_stocks = self.get_candidates_by_market(market)
-        total = len(target_stocks)
-        logger.info(f"{market}市場の銘柄数: {total}")
+        total_market = len(target_stocks)
+        logger.info(f"{market}市場の銘柄数: {total_market}")
+
+        if scale_categories:
+            target_stocks = filter_by_scale_category(target_stocks, scale_categories)
+            logger.info(
+                f"ScaleCat絞り込み後: {len(target_stocks)}社"
+                f"（フィルタ: {tuple(scale_categories)}）"
+            )
 
         if limit is not None:
             target_stocks = target_stocks[:limit]
-            logger.info(f"テスト制限: 先頭{limit}件のみ処理")
+            logger.info(f"件数制限: 先頭{limit}件のみ処理")
+
+        # bulk モード判定：日付範囲が両方とも未指定なら一括取得を試みる。
+        use_bulk_quotes = quote_from_date is None and quote_to_date is None
+        close_map: dict[str, float] = {}
+        if use_bulk_quotes:
+            logger.info("株価を bulk モードで一括取得中（/equities/bars/daily?date=...）")
+            close_map = self.fetch_latest_close_map()
+            if not close_map:
+                # 7日遡って空＝API障害かデータ未配信。明示的に失敗させる。
+                raise RuntimeError(
+                    "全銘柄株価マップが空でした。bulk モードでスクリーニング不能です。"
+                    "（休場連続・API障害・date 仕様変更の可能性）"
+                )
 
         candidates: list[dict[str, Any]] = []
         for i, stock in enumerate(target_stocks, 1):
             code = stock["Code"]
             name = stock.get("CoName", "")
+            normalized = normalize_code(code)
+            pre_close = close_map.get(normalized) if use_bulk_quotes else None
+
             try:
                 result = self.evaluate_stock(
                     code,
+                    latest_close=pre_close,
                     quote_from_date=quote_from_date,
                     quote_to_date=quote_to_date,
                 )
