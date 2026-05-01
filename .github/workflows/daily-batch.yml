@@ -1,9 +1,17 @@
 name: Daily AI Trade Batch
 
 # トリガーは workflow_dispatch のみ。
-# 定刻実行は cron-job.org（外部サービス、無料）が JST 8:00/12:00/15:00 に
-# GitHub API（POST /actions/workflows/daily-batch.yml/dispatches）で叩く。
-# GitHub Actions の内蔵 cron は数時間の遅延が発生するため使わない。
+# 定刻実行は cron-job.org（外部サービス、無料）が
+# **JST 8:00 / 12:00 / 15:00 の月〜金のみ** に GitHub API
+# （POST /actions/workflows/daily-batch.yml/dispatches）で叩く。
+#
+# 土日は東証が休場で売買できないため、バッチを動かす意味がない。
+# 平日のみに絞ることで月コスト約 25%削減（100円程度のクラウド費用差は小さいが、
+# Anthropic API 呼び出しを土日丸2回×3バッチ = 6回減らせる）。
+#
+# ※ GitHub Actions の内蔵 cron は数時間の遅延が発生するため使わない。
+# ※ スケジュール変更時は cron-job.org のダッシュボードで「Days of week」を
+#    Mon/Tue/Wed/Thu/Fri のみチェックに変更すること（タイムゾーンは JST 想定）。
 on:
   workflow_dispatch:
 
