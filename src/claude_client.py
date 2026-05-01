@@ -16,6 +16,45 @@ from src.secrets_loader import get_secret
 logger = logging.getLogger(__name__)
 
 
+# ─── Anthropic 公式価格表（USD / 1M トークン）2026-04 時点 ───
+# https://platform.claude.com/docs/en/about-claude/models/overview
+_PRICE_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    # model_id_prefix: (input_$/1M, output_$/1M)
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+}
+
+
+def _price_for(model: str) -> tuple[float, float]:
+    """モデルIDから (input単価, output単価) を返す。未知モデルは Sonnet 価格でフォールバック。"""
+    for prefix, price in _PRICE_USD_PER_MTOK.items():
+        if model.startswith(prefix):
+            return price
+    return _PRICE_USD_PER_MTOK["claude-sonnet-4-6"]
+
+
+def _log_usage(model: str, usage: Any) -> None:
+    """1リクエストの input / output トークン数とコスト概算を INFO ログに出す。
+
+    Anthropic SDK は response.usage に input_tokens / output_tokens / cache_*
+    を返す。後段でログを集計してバッチ全体のコスト概算を取れるよう、
+    1行で機械可読な形で出力する。
+    """
+    in_tok = getattr(usage, "input_tokens", 0) or 0
+    out_tok = getattr(usage, "output_tokens", 0) or 0
+    cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    in_price, out_price = _price_for(model)
+    cost_usd = in_tok * in_price / 1e6 + out_tok * out_price / 1e6
+    logger.info(
+        f"[claude_usage] model={model} input={in_tok} output={out_tok} "
+        f"cache_create={cache_create} cache_read={cache_read} "
+        f"cost_usd={cost_usd:.4f}"
+    )
+
+
 class WebSearchResult(TypedDict):
     """`ask_with_web_search` の返却型。"""
 
@@ -62,6 +101,7 @@ class ClaudeClient:
             kwargs["system"] = system
 
         response = self._client.messages.create(**kwargs)
+        _log_usage(model, response.usage)
         # 応答は content blocks のリスト。テキストだけを結合して返す。
         parts: list[str] = []
         for block in response.content:
@@ -111,6 +151,7 @@ class ClaudeClient:
             kwargs["system"] = system
 
         response = self._client.messages.create(**kwargs)
+        _log_usage(model, response.usage)
 
         text_parts: list[str] = []
         citations: list[dict[str, Any]] = []
