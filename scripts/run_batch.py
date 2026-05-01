@@ -166,31 +166,42 @@ def main() -> None:
             traceback.print_exc()
 
     # ─── 4. 詳細分析（Sonnet + Web検索、Tier A 上位） ───
+    # Anthropic Sonnet 4.6 の組織レート制限（30,000 input tokens/分）を回避するため、
+    # 各銘柄の API 呼び出し後に 60秒スリープを挟む（最後の1件の後はスリープしない）。
+    SONNET_SLEEP_BETWEEN_SEC = 60.0
     tier_a = [t for t in tiers if t.tier == "A"][:DETAILED_ANALYSIS_LIMIT]
     if tier_a:
         print(f"\n🔍 Step 3: 詳細分析（Tier A 上位{len(tier_a)}件）...")
+        # Tier A 銘柄の dict を candidates から抽出
+        tier_a_stocks: list[dict[str, Any]] = []
         for target in tier_a:
             stock = next((c for c in candidates if c["code"] == target.code), None)
-            if stock is None:
-                continue
-            try:
-                analysis = analyzer.analyze_stock(stock, market_overview=overview)
-                db.save_recommendation({
-                    "batch_datetime": batch_dt,
-                    "code": analysis.code,
-                    "name": analysis.name,
-                    "recommendation": analysis.recommendation,
-                    "tier": "A",
-                    "reasoning": _split_lines(analysis.reasoning),
-                    "risks": analysis.risks,
-                    "citation_count": len(analysis.citations),
-                    "latest_close": stock.get("latest_close"),
-                    "market_cap": stock.get("market_cap"),
-                })
-                print(f"  ✅ {analysis.code} {analysis.name}: {analysis.recommendation.upper()}")
-            except Exception as e:
-                print(f"  ❌ {target.code}: 詳細分析失敗 ({e})")
+            if stock is not None:
+                tier_a_stocks.append(stock)
+
+        for stock, analysis, error in analyzer.analyze_stocks_throttled(
+            tier_a_stocks,
+            market_overview=overview,
+            sleep_between_seconds=SONNET_SLEEP_BETWEEN_SEC,
+        ):
+            code = stock.get("code", "?")
+            if error is not None or analysis is None:
+                print(f"  ❌ {code}: 詳細分析失敗 ({error})")
                 traceback.print_exc()
+                continue
+            db.save_recommendation({
+                "batch_datetime": batch_dt,
+                "code": analysis.code,
+                "name": analysis.name,
+                "recommendation": analysis.recommendation,
+                "tier": "A",
+                "reasoning": _split_lines(analysis.reasoning),
+                "risks": analysis.risks,
+                "citation_count": len(analysis.citations),
+                "latest_close": stock.get("latest_close"),
+                "market_cap": stock.get("market_cap"),
+            })
+            print(f"  ✅ {analysis.code} {analysis.name}: {analysis.recommendation.upper()}")
 
     # Tier B 以下も HOLD として保存（一覧表示用）
     if tiers:

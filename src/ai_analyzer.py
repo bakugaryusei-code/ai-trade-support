@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 from src.claude_client import ClaudeClient
 
@@ -223,6 +224,49 @@ class AIAnalyzer:
             raw_text=raw,
             citations=result["citations"],
         )
+
+    def analyze_stocks_throttled(
+        self,
+        stocks: list[dict[str, Any]],
+        market_overview: MarketOverview | None = None,
+        sleep_between_seconds: float = 60.0,
+    ) -> Iterator[tuple[dict[str, Any], "StockAnalysis | None", "Exception | None"]]:
+        """複数銘柄を順次詳細分析するスロットリング付きジェネレータ。
+
+        Anthropic Sonnet 4.6 の組織レート制限（30,000 input tokens/分）を
+        回避するため、各 analyze_stock 呼び出しの **後** に
+        sleep_between_seconds 秒のスリープを挟む。最後の銘柄の処理後は
+        スリープしない（バッチ時間の無駄を最小化）。
+
+        ジェネレータなので、消費側の保存・ロギング処理時間はスリープと
+        重なる（ウォールクロックは sleep のみ加算）。
+
+        Args:
+            stocks: 詳細分析対象の銘柄リスト（screening の result dict 形式）。
+            market_overview: 市場概況（あれば各分析プロンプトに含める）。
+            sleep_between_seconds: 各銘柄の API 呼び出し **後** の待機秒数。
+                0 を渡すとスリープしない（テスト用）。
+
+        Yields:
+            (stock, analysis, error) の tuple。
+              - 成功時: (stock, StockAnalysis, None)
+              - 失敗時: (stock, None, Exception)
+            呼び出し側で per-stock の保存・エラーログ処理を行う。
+        """
+        n = len(stocks)
+        for i, stock in enumerate(stocks):
+            try:
+                analysis = self.analyze_stock(stock, market_overview=market_overview)
+                yield (stock, analysis, None)
+            except Exception as e:
+                yield (stock, None, e)
+
+            is_last = (i == n - 1)
+            if not is_last and sleep_between_seconds > 0:
+                logger.info(
+                    f"レート制限回避: 次の詳細分析まで {sleep_between_seconds:.0f}秒待機中…"
+                )
+                time.sleep(sleep_between_seconds)
 
     # ─── 内部ヘルパー ──────────────────
 
