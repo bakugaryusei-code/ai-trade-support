@@ -100,7 +100,16 @@ class ClaudeClient:
         if system:
             kwargs["system"] = system
 
-        response = self._client.messages.create(**kwargs)
+        # 大きい max_tokens の場合、Anthropic SDK は「10分超のリクエストは
+        # ストリーミング必須」というガードで ValueError を投げる。Tier分類は
+        # 単発の同期呼び出しのため、timeout を明示的に20分まで延ばして
+        # 非ストリーミングを継続する（実測では Haiku 32K で 30-90秒程度）。
+        client = (
+            self._client.with_options(timeout=1200.0)
+            if max_tokens > 16000
+            else self._client
+        )
+        response = client.messages.create(**kwargs)
         _log_usage(model, response.usage)
         # 応答は content blocks のリスト。テキストだけを結合して返す。
         parts: list[str] = []
