@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 
 import streamlit as st
 
@@ -80,11 +80,15 @@ def _format_yen(yen: float | int | None) -> str:
 # ─────────────────────────────────────────
 
 st.title("📈 AIトレードサポート")
-st.caption(f"10万円元手 × SBI S株 × スイングトレード")
 
+# 「最終更新」は datetime.now()（ページを開いた時刻）ではなく、
+# 実際にバッチが走ってデータが書き込まれた時刻（Supabase recommendations の
+# 最新 batch_datetime）を表示する。リロードしても更新されないため
+# データの新しさを正しく反映できる。
+_last_batch = db.get_latest_batch_datetime()
 c1, c2 = st.columns(2)
-c1.caption(f"最終更新: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-c2.caption("🪙 J-Quants: Free / ⚠️ データ12週間遅延")
+c1.caption(f"最終バッチ: {_last_batch or '—'}")
+c2.caption("🪙 J-Quants: Light / 当日データ")
 
 
 # ─────────────────────────────────────────
