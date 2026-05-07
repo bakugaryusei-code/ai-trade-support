@@ -180,38 +180,105 @@ class AIAnalyzer:
         self,
         stock: dict[str, Any],
         market_overview: MarketOverview | None = None,
+        holdings_context: str | None = None,
     ) -> StockAnalysis:
-        """Sonnet + Web検索で1銘柄を詳細分析し、買い/売り/様子見の推奨を出す。"""
+        """Sonnet + Web検索で1銘柄を詳細分析し、買い/売り/様子見の推奨を出す。
+
+        仕様書 v1.1 のユーザー前提（10万円・スイング・初心者・堅実）に基づく
+        5つの制約条件をプロンプトに明示する。
+
+        Args:
+            stock: 候補銘柄の dict。少なくとも code / name / latest_close /
+                market_cap / profit_value / disclosed_date を含むこと。
+            market_overview: あれば各分析プロンプトに含める市場概況。
+            holdings_context: 既保有銘柄の概要文字列（分散リスク判断用）。
+                None または空文字列のときは「現在保有なし」として扱う。
+        """
         mc_oku = (stock.get("market_cap") or 0) / 1e8
         overview_text = market_overview.summary if market_overview else "（市場概況情報なし）"
+        holdings_text = holdings_context if (holdings_context or "").strip() else "（現在保有なし）"
+
+        # 単価による予算判定を事前計算してプロンプトに添える（Claude の判断補助）
+        latest_close = stock.get("latest_close")
+        try:
+            close_val = float(latest_close) if latest_close is not None else None
+        except (ValueError, TypeError):
+            close_val = None
+        if close_val is None:
+            affordability_note = "判定不能（株価データなし）"
+        elif close_val > 30000:
+            affordability_note = (
+                f"⚠️ 1株単価 {close_val:,.0f}円 は3万円超 → "
+                "10万円ポートフォリオで分散買付不可、BUY 推奨**禁止**"
+            )
+        else:
+            max_shares = int(30000 / close_val)
+            affordability_note = (
+                f"1株単価 {close_val:,.0f}円 → 3万円枠で約{max_shares}株購入可"
+            )
 
         prompt = (
             "あなたは日本株のスイングトレード向けアナリストです。\n"
             "以下の銘柄について、Web検索で直近のニュース・IR・決算情報を収集し、"
             "投資判断を**明確に**推奨してください。\n\n"
+
+            "--- ユーザー前提（必ず遵守） ---\n"
+            "・元手 **10万円**、SBI証券のS株（単元未満株、1株から購入可）\n"
+            "・スイングトレード（数日〜数週間保有）の **初心者**\n"
+            "・短期で大きく稼ぐより **負けないこと** を優先する設計\n"
+            "・1銘柄あたりの想定投資額は **最大3万円**（10万円を3〜4銘柄に分散）\n\n"
+
+            "--- 投資判断の制約条件（必ず守ること） ---\n"
+            "**制約1: 株価制約（3万円ルール）**\n"
+            f"   {affordability_note}\n"
+            "   1株単価が3万円超の銘柄は BUY 推奨せず **HOLD** とし、根拠に\n"
+            "   「単価が高すぎて10万円ポートフォリオに組み込みにくい」と明記する。\n\n"
+            "**制約2: 決算前後の BUY 禁止**\n"
+            "   Web検索で **次回** 決算発表予定日を必ず確認し、本日から ±3営業日\n"
+            "   以内に発表予定なら BUY ではなく **HOLD** とする（決算ギャンブル防止）。\n"
+            "   次回決算日が分からない場合も慎重側に倒し、HOLD 寄りで判断する。\n\n"
+            "**制約3: 短期イベントドリブン BUY の禁止**\n"
+            "   以下を **主要根拠** とした BUY は出さない（補助的な言及はOK）:\n"
+            "   - 「決算サプライズ期待」「ギャップアップ狙い」\n"
+            "   - 「材料出尽くし反発期待」「催促相場期待」\n"
+            "   テクニカル + ファンダの **両方** が肯定的な場合のみ BUY、\n"
+            "   片方だけなら HOLD とする。\n\n"
+            "**制約4: リスク要因の重み付け（重要）**\n"
+            "   - リスク欄に「高バリュエーション」「PER過熱」「テクニカル調整懸念」の\n"
+            "     いずれかを挙げる場合は **原則 HOLD**\n"
+            "   - リスク要因を **3件以上** 挙げる場合は **原則 HOLD**\n"
+            "   - 「負けないこと優先」のため迷ったら HOLD に倒す\n\n"
+            "**制約5: 既保有銘柄との分散**\n"
+            f"   保有中銘柄: {holdings_text}\n"
+            "   保有中の銘柄と同じ **33業種分類** に該当する場合は集中リスクを\n"
+            "   リスク欄に明記し、BUY を慎重に判断する（同業種の重複は基本回避）。\n\n"
+
             "--- 分析対象 ---\n"
             f"銘柄コード: {stock.get('code')}\n"
             f"会社名:     {stock.get('name', '')}\n"
-            f"直近終値:   {stock.get('latest_close', 'N/A')}\n"
+            f"直近終値:   {latest_close} 円\n"
             f"時価総額:   {mc_oku:.0f}億円\n"
             f"純利益:     {stock.get('profit_value', 'N/A')}\n"
-            f"開示日:     {stock.get('disclosed_date', 'N/A')}\n\n"
+            f"前回開示日: {stock.get('disclosed_date', 'N/A')} （※次回決算日は Web検索で確認）\n\n"
+
             "--- 市場概況 ---\n"
             f"{overview_text}\n\n"
+
             "--- 出力形式（必ずこの構造で返答） ---\n"
             "## 推奨\n"
             "[buy / sell / hold のいずれか1語]\n\n"
             "## 根拠\n"
-            "- 箇条書きで3〜5点、具体的な事実・数値・ニュースを引用\n\n"
+            "- 箇条書きで3〜5点、具体的な事実・数値・ニュースを引用\n"
+            "- 上記の制約1〜5を踏まえた判断であることが分かる記載にすること\n\n"
             "## リスク要因\n"
-            "- 箇条書きで2〜3点\n"
+            "- 箇条書きで2〜4点（4件目以上は HOLD 推奨に整合させる）\n"
         )
 
         result = self._client.ask_with_web_search(
             prompt,
             heavy=True,
             max_searches=3,
-            max_tokens=2048,
+            max_tokens=4096,
         )
         raw = result["text"]
 
@@ -230,6 +297,7 @@ class AIAnalyzer:
         stocks: list[dict[str, Any]],
         market_overview: MarketOverview | None = None,
         sleep_between_seconds: float = 60.0,
+        holdings_context: str | None = None,
     ) -> Iterator[tuple[dict[str, Any], "StockAnalysis | None", "Exception | None"]]:
         """複数銘柄を順次詳細分析するスロットリング付きジェネレータ。
 
@@ -256,7 +324,11 @@ class AIAnalyzer:
         n = len(stocks)
         for i, stock in enumerate(stocks):
             try:
-                analysis = self.analyze_stock(stock, market_overview=market_overview)
+                analysis = self.analyze_stock(
+                    stock,
+                    market_overview=market_overview,
+                    holdings_context=holdings_context,
+                )
                 yield (stock, analysis, None)
             except Exception as e:
                 yield (stock, None, e)

@@ -166,12 +166,37 @@ def main() -> None:
             traceback.print_exc()
 
     # ─── 4. 詳細分析（Sonnet + Web検索、Tier A 上位） ───
+    # 仕様書 v1.1 の前提（10万円・スイング・初心者・堅実）を満たすため、
+    # 以下の制約を二重防御で適用する:
+    #   制約1: 1株単価 > 30,000円 → HOLD（プロンプト + 事後チェック）
+    #   制約2-4: 決算前後/イベントドリブン/リスク重み付け（プロンプト指示）
+    #   制約5: 既保有銘柄と同業種で集中リスク警告 + BUY は1日最大2件（事後カップ）
+    #
     # Anthropic Sonnet 4.6 の組織レート制限（30,000 input tokens/分）を回避するため、
     # 各銘柄の API 呼び出し後に 60秒スリープを挟む（最後の1件の後はスリープしない）。
     SONNET_SLEEP_BETWEEN_SEC = 60.0
+    MAX_PRICE_PER_SHARE = 30_000  # 制約1: 1株単価上限
+    MAX_DAILY_BUY = 2             # 制約5: 1日の BUY 推奨件数上限
+
     tier_a = [t for t in tiers if t.tier == "A"][:DETAILED_ANALYSIS_LIMIT]
     if tier_a:
+        # 保有中銘柄を取得して、Sonnet プロンプトに分散リスク判断用のコンテキストを渡す
+        try:
+            holdings = db.get_holdings()
+        except Exception as e:
+            print(f"⚠️ 保有銘柄取得失敗（分散判断はスキップ）: {e}")
+            holdings = []
+        if holdings:
+            holdings_context = ", ".join(
+                f"{h.get('code')} {h.get('name', '')}".strip() for h in holdings
+            )
+        else:
+            holdings_context = ""
+
         print(f"\n🔍 Step 3: 詳細分析（Tier A 上位{len(tier_a)}件）...")
+        if holdings_context:
+            print(f"   保有銘柄コンテキスト: {holdings_context}")
+
         # Tier A 銘柄の dict を candidates から抽出
         tier_a_stocks: list[dict[str, Any]] = []
         for target in tier_a:
@@ -179,16 +204,55 @@ def main() -> None:
             if stock is not None:
                 tier_a_stocks.append(stock)
 
+        # 事後制約のための BUY 件数カウンタ
+        buy_count = 0
+
         for stock, analysis, error in analyzer.analyze_stocks_throttled(
             tier_a_stocks,
             market_overview=overview,
             sleep_between_seconds=SONNET_SLEEP_BETWEEN_SEC,
+            holdings_context=holdings_context or None,
         ):
             code = stock.get("code", "?")
             if error is not None or analysis is None:
                 print(f"  ❌ {code}: 詳細分析失敗 ({error})")
                 traceback.print_exc()
                 continue
+
+            # ─── 事後制約1: 株価3万円超は強制 HOLD ───
+            # プロンプトでも指示しているが、Claude が見落とした場合の安全網
+            try:
+                close_val = float(stock.get("latest_close")) if stock.get("latest_close") is not None else None
+            except (ValueError, TypeError):
+                close_val = None
+            if (
+                analysis.recommendation == "buy"
+                and close_val is not None
+                and close_val > MAX_PRICE_PER_SHARE
+            ):
+                print(
+                    f"  ⚠️ {code}: 単価 {close_val:,.0f}円 > {MAX_PRICE_PER_SHARE:,}円 のため BUY → HOLD に降格"
+                )
+                analysis.recommendation = "hold"
+                analysis.risks.insert(
+                    0,
+                    f"1株単価 {close_val:,.0f}円 > 30,000円のため、10万円ポートフォリオで分散買付不可"
+                )
+
+            # ─── 事後制約5: BUY は1日最大 MAX_DAILY_BUY 件 ───
+            if analysis.recommendation == "buy":
+                if buy_count >= MAX_DAILY_BUY:
+                    print(
+                        f"  ⚠️ {code}: 本日の BUY が既に {MAX_DAILY_BUY}件に達したため BUY → HOLD に降格"
+                    )
+                    analysis.recommendation = "hold"
+                    analysis.risks.insert(
+                        0,
+                        f"本日の BUY 推奨は既に{MAX_DAILY_BUY}件に達したため、{MAX_DAILY_BUY+1}件目以降は HOLD に統一"
+                    )
+                else:
+                    buy_count += 1
+
             db.save_recommendation({
                 "batch_datetime": batch_dt,
                 "code": analysis.code,
