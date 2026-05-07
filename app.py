@@ -14,6 +14,7 @@ from datetime import date
 import streamlit as st
 
 from src import db
+from src.config import BUDGET_PER_STOCK_YEN
 
 # ─────────────────────────────────────────
 # ページ設定
@@ -63,6 +64,25 @@ def _reco_badge(recommendation: str) -> str:
         "sell": "🔴 **SELL（売り推奨）**",
         "hold": "🟡 **HOLD（様子見）**",
     }.get(recommendation, "⚪ **UNKNOWN**")
+
+
+def _affordability_marker(latest_close: float | int | None) -> str:
+    """1株単価が現在の銘柄予算（BUDGET_PER_STOCK_YEN）に収まるかをマーカーで返す。
+
+    投資判断（BUY/HOLD/SELL）とは独立した別軸の表示用。
+    予算が増えたら src/config.py の BUDGET_PER_STOCK_YEN を更新するだけで反映される。
+    """
+    if latest_close is None:
+        return "ー 単価不明（予算判定不能）"
+    try:
+        price = float(latest_close)
+    except (ValueError, TypeError):
+        return "ー 単価不明（予算判定不能）"
+    budget = BUDGET_PER_STOCK_YEN
+    if price <= budget:
+        max_shares = max(int(budget / price), 1)
+        return f"◯ 現予算（{budget:,}円）で購入可（最大 {max_shares}株）"
+    return f"△ 予算オーバー（1株 {price:,.0f}円 > 予算 {budget:,}円）"
 
 
 def _format_yen(yen: float | int | None) -> str:
@@ -146,6 +166,7 @@ with tab_reco:
                 )
 
             st.markdown(_reco_badge(rec["recommendation"]))
+            st.caption(_affordability_marker(rec.get("latest_close")))
 
             st.markdown("**📝 根拠**")
             for r in rec["reasoning"]:

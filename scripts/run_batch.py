@@ -166,17 +166,19 @@ def main() -> None:
             traceback.print_exc()
 
     # ─── 4. 詳細分析（Sonnet + Web検索、Tier A 上位） ───
-    # 仕様書 v1.1 の前提（10万円・スイング・初心者・堅実）を満たすため、
-    # 以下の制約を二重防御で適用する:
-    #   制約1: 1株単価 > 30,000円 → HOLD（プロンプト + 事後チェック）
-    #   制約2-4: 決算前後/イベントドリブン/リスク重み付け（プロンプト指示）
-    #   制約5: 既保有銘柄と同業種で集中リスク警告 + BUY は1日最大2件（事後カップ）
+    # 仕様書 v1.1 の前提（スイング・初心者・堅実）を満たすため、
+    # 以下の制約を適用する:
+    #   制約1-3: 決算前後/イベントドリブン/リスク重み付け（プロンプト指示）
+    #   制約4: 既保有銘柄と同業種で集中リスク警告（プロンプト指示）+
+    #          BUY は1日最大2件（事後カップ）
+    #
+    # ※ 価格・予算による BUY/HOLD 振り分けは行わない（純粋な投資判断）。
+    #   予算オーバー判定は表示側（app.py）で別マーカーとして扱う。
     #
     # Anthropic Sonnet 4.6 の組織レート制限（30,000 input tokens/分）を回避するため、
     # 各銘柄の API 呼び出し後に 60秒スリープを挟む（最後の1件の後はスリープしない）。
     SONNET_SLEEP_BETWEEN_SEC = 60.0
-    MAX_PRICE_PER_SHARE = 30_000  # 制約1: 1株単価上限
-    MAX_DAILY_BUY = 2             # 制約5: 1日の BUY 推奨件数上限
+    MAX_DAILY_BUY = 2             # 制約4: 1日の BUY 推奨件数上限
 
     tier_a = [t for t in tiers if t.tier == "A"][:DETAILED_ANALYSIS_LIMIT]
     if tier_a:
@@ -219,27 +221,7 @@ def main() -> None:
                 traceback.print_exc()
                 continue
 
-            # ─── 事後制約1: 株価3万円超は強制 HOLD ───
-            # プロンプトでも指示しているが、Claude が見落とした場合の安全網
-            try:
-                close_val = float(stock.get("latest_close")) if stock.get("latest_close") is not None else None
-            except (ValueError, TypeError):
-                close_val = None
-            if (
-                analysis.recommendation == "buy"
-                and close_val is not None
-                and close_val > MAX_PRICE_PER_SHARE
-            ):
-                print(
-                    f"  ⚠️ {code}: 単価 {close_val:,.0f}円 > {MAX_PRICE_PER_SHARE:,}円 のため BUY → HOLD に降格"
-                )
-                analysis.recommendation = "hold"
-                analysis.risks.insert(
-                    0,
-                    f"1株単価 {close_val:,.0f}円 > 30,000円のため、10万円ポートフォリオで分散買付不可"
-                )
-
-            # ─── 事後制約5: BUY は1日最大 MAX_DAILY_BUY 件 ───
+            # ─── 事後制約4: BUY は1日最大 MAX_DAILY_BUY 件 ───
             if analysis.recommendation == "buy":
                 if buy_count >= MAX_DAILY_BUY:
                     print(
