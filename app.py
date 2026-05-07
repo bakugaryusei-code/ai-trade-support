@@ -58,11 +58,19 @@ db.seed_if_empty()
 
 
 def _reco_badge(recommendation: str) -> str:
-    """buy/sell/hold を色付きバッジに変換。"""
+    """未保有銘柄の buy/hold を色付きバッジに変換（推奨タブで使用）。"""
     return {
         "buy":  "🟢 **BUY（買い推奨）**",
-        "sell": "🔴 **SELL（売り推奨）**",
         "hold": "🟡 **HOLD（様子見）**",
+    }.get(recommendation, "⚪ **UNKNOWN**")
+
+
+def _held_badge(recommendation: str) -> str:
+    """保有銘柄の hold/sell/add を色付きバッジに変換（保有タブで使用）。"""
+    return {
+        "hold": "🟡 **HOLD（継続保有）**",
+        "sell": "🔴 **SELL（売却推奨）**",
+        "add":  "🟢 **ADD（買い増し推奨）**",
     }.get(recommendation, "⚪ **UNKNOWN**")
 
 
@@ -135,23 +143,24 @@ with tab_reco:
         else:
             st.info("市場概況はまだ取得されていません（次の朝のバッチ 8時 で生成されます）。")
 
-    st.subheader("🎯 今日のAI推奨")
+    st.subheader("🎯 今日のBUY推奨")
 
-    # 推奨枠は Tier A（Claude Sonnet が Web検索付きで詳細分析した銘柄）のみ表示。
-    # Tier B/C も Supabase には保存されているが、根拠は Haiku の30字理由のみで
-    # 詳細分析を経ていないため、推奨枠に並べるとミスリーディング。
-    # Tier B/C の一覧表示が必要になったら別タブ・別画面で扱う方針（別件）。
+    # 推奨タブは「今日 **買うべき** 銘柄リスト」のみ表示。
+    # Tier A の中でも recommendation == "buy" のみが対象。HOLD は AI が
+    # 「買うほどではない」と判断した未保有銘柄なので、ユーザーには無意味
+    # （未保有なので保有継続も売却もできない）→ 表示しない。
     all_recs = db.get_todays_recommendations()
-    recs = [r for r in all_recs if r.get("tier") == "A"]
+    recs = [
+        r for r in all_recs
+        if r.get("tier") == "A" and r.get("recommendation") == "buy"
+    ]
 
     if not recs:
-        if all_recs:
-            st.info(
-                f"今日のバッチでは Tier A（詳細分析対象）に該当する銘柄がありませんでした。"
-                f"（候補のスクリーニング結果は {len(all_recs)} 件あります。）"
-            )
-        else:
-            st.info("現在の推奨銘柄はありません。次のバッチ（12時）をお待ちください。")
+        st.info(
+            "本日の **BUY 推奨はありません**。\n\n"
+            "AI が「今日積極的に買うべき銘柄」と判断したものはありませんでした。"
+            "次のバッチ（昼12時 / 夕方15時）をお待ちください。"
+        )
 
     for rec in recs:
         with st.container(border=True):
@@ -194,6 +203,11 @@ with tab_hold:
     st.subheader("📊 保有銘柄")
 
     holdings = db.get_holdings()
+    # 最新バッチの「保有判断」（tier='HELD'）を code で引けるよう辞書化
+    held_judgments = {
+        r.get("code"): r for r in all_recs if r.get("tier") == "HELD"
+    }
+
     if not holdings:
         st.info(
             "現在、保有銘柄はありません。\n\n"
@@ -201,14 +215,36 @@ with tab_hold:
         )
     else:
         for h in holdings:
+            judgment = held_judgments.get(h["code"])
             with st.container(border=True):
                 st.markdown(f"### {h['code']} {h['name']}")
                 col1, col2 = st.columns(2)
                 col1.metric("保有株数", f"{h['shares']}株")
                 col2.metric("平均取得単価", f"{h['avg_cost']:,.0f}円")
-                st.caption(
-                    "含み損益は現在値取得のインフラ実装後に表示されます（運用開始時に対応）"
-                )
+
+                if judgment:
+                    st.markdown(_held_badge(judgment.get("recommendation", "")))
+
+                    reasoning = judgment.get("reasoning") or []
+                    if reasoning:
+                        st.markdown("**📝 根拠**")
+                        for r in reasoning:
+                            st.markdown(f"- {r}")
+
+                    risks = judgment.get("risks") or []
+                    if risks:
+                        st.markdown("**⚠️ リスク要因**")
+                        for r in risks:
+                            st.markdown(f"- {r}")
+
+                    st.caption(
+                        f"🔗 参照元 {judgment.get('citation_count', 0)}件｜"
+                        f"更新 {judgment.get('updated_at', '')}"
+                    )
+                else:
+                    st.caption(
+                        "AI判断: 次回バッチで生成されます（朝・昼・夕に更新）"
+                    )
 
 
 # ───── 📝 記録タブ ─────────────────────

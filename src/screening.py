@@ -163,6 +163,8 @@ class Screener:
 
     def __init__(self, client: JQuantsClient | None = None) -> None:
         self._client = client or JQuantsClient()
+        # run() 後に最新営業日の {正規化4桁コード: 終値} を保持（保有銘柄の現在値取得に再利用）
+        self.last_close_map: dict[str, float] = {}
 
     def get_candidates_by_market(
         self,
@@ -312,6 +314,8 @@ class Screener:
                     "全銘柄株価マップが空でした。bulk モードでスクリーニング不能です。"
                     "（休場連続・API障害・date 仕様変更の可能性）"
                 )
+            # 後段（保有銘柄の現在値取得など）で再利用するためインスタンスにも保持
+            self.last_close_map = close_map
 
         candidates: list[dict[str, Any]] = []
         for i, stock in enumerate(target_stocks, 1):

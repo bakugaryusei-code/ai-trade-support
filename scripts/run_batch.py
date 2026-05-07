@@ -29,7 +29,7 @@ from src import db
 from src.ai_analyzer import AIAnalyzer
 from src.config import SCALE_CATEGORY_FILTER, SCREENING_MARKET
 from src.jquants_client import JQuantsClient
-from src.screening import Screener
+from src.screening import Screener, normalize_code
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +249,7 @@ def main() -> None:
             })
             print(f"  ✅ {analysis.code} {analysis.name}: {analysis.recommendation.upper()}")
 
-    # Tier B 以下も HOLD として保存（一覧表示用）
+    # Tier B 以下も HOLD として保存（履歴用、推奨枠には出さない）
     if tiers:
         for t in tiers:
             if t.tier in ("B", "C"):
@@ -271,6 +271,50 @@ def main() -> None:
                     })
                 except Exception as e:
                     logger.warning(f"{t.code} 保存失敗: {e}")
+
+    # ─── 5. 保有銘柄の継続/売却/買い増し判断（HOLD/SELL/ADD） ───
+    # 推奨タブ（未保有向け BUY）と保有タブ（保有向け HOLD/SELL/ADD）でラベル体系を分離。
+    # 保有がゼロのときは Step 5 を完全スキップしてコスト発生なし。
+    if holdings:
+        print(f"\n💼 Step 4: 保有銘柄の継続/売却/買い増し判断（{len(holdings)}件）...")
+        # 各保有銘柄に最新終値を付与（screener が Step 1 で取得したマップを再利用）
+        held_with_prices: list[dict[str, Any]] = []
+        for h in holdings:
+            code_norm = normalize_code(h.get("code", ""))
+            held_with_prices.append({
+                **h,
+                "latest_close": screener.last_close_map.get(code_norm),
+            })
+
+        for held, analysis, error in analyzer.analyze_held_positions_throttled(
+            held_with_prices,
+            market_overview=overview,
+            sleep_between_seconds=SONNET_SLEEP_BETWEEN_SEC,
+            holdings_context=holdings_context or None,
+        ):
+            code = held.get("code", "?")
+            if error is not None or analysis is None:
+                print(f"  ❌ {code}: 保有判断失敗 ({error})")
+                traceback.print_exc()
+                continue
+            try:
+                db.save_recommendation({
+                    "batch_datetime": batch_dt,
+                    "code": analysis.code,
+                    "name": analysis.name,
+                    "recommendation": analysis.recommendation,  # hold / sell / add
+                    "tier": "HELD",                              # 推奨タブとの分離フラグ
+                    "reasoning": _split_lines(analysis.reasoning),
+                    "risks": analysis.risks,
+                    "citation_count": len(analysis.citations),
+                    "latest_close": held.get("latest_close"),
+                    "market_cap": None,
+                })
+            except Exception as e:
+                logger.warning(f"{code} 保有判断保存失敗: {e}")
+            print(f"  ✅ {analysis.code} {analysis.name}: {analysis.recommendation.upper()}")
+    else:
+        print("\n💼 Step 4: 保有銘柄なし → 保有判断スキップ")
 
     print("\n🎉 バッチ完了")
 

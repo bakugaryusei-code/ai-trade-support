@@ -250,7 +250,7 @@ class AIAnalyzer:
 
             "--- 出力形式（必ずこの構造で返答） ---\n"
             "## 推奨\n"
-            "[buy / sell / hold のいずれか1語]\n\n"
+            "[buy / hold のいずれか1語] ※ sell は出力しないこと（未保有銘柄のため意味がない）\n\n"
             "## 根拠\n"
             "- 箇条書きで3〜5点、具体的な事実・数値・ニュースを引用\n"
             "- 上記の制約1〜4を踏まえた判断であることが分かる記載にすること\n\n"
@@ -269,12 +269,165 @@ class AIAnalyzer:
         return StockAnalysis(
             code=stock.get("code", ""),
             name=stock.get("name", ""),
-            recommendation=self._extract_recommendation(raw),
+            recommendation=self._extract_recommendation(raw, allowed=("buy", "hold")),
             reasoning=self._extract_section(raw, "根拠"),
             risks=self._extract_bullets(self._extract_section(raw, "リスク要因")),
             raw_text=raw,
             citations=result["citations"],
         )
+
+    # ─── Step 4: 保有銘柄の継続/売却/買い増し判断 ───────────
+
+    def analyze_held_position(
+        self,
+        holding: dict[str, Any],
+        market_overview: MarketOverview | None = None,
+        holdings_context: str | None = None,
+    ) -> StockAnalysis:
+        """保有ポジションについて HOLD/SELL/ADD のいずれかを Sonnet+Web検索で判断。
+
+        未保有銘柄向けの analyze_stock とは出力ラベルが異なる:
+          - hold: 継続保有（特に変化なし、もしくは様子見）
+          - sell: 売却推奨（リスク顕在化 or 利確タイミング）
+          - add:  買い増し推奨（追加買付が魅力的な水準・タイミング）
+
+        Args:
+            holding: 保有銘柄の dict。code / name / shares / avg_cost / latest_close を含む。
+            market_overview: 市場概況。
+            holdings_context: 全保有銘柄の概要（同業種ペナルティ用）。
+        """
+        code = holding.get("code", "")
+        name = holding.get("name", "")
+        shares = int(holding.get("shares") or 0)
+        try:
+            avg_cost = float(holding.get("avg_cost") or 0)
+        except (ValueError, TypeError):
+            avg_cost = 0.0
+        latest_close = holding.get("latest_close")
+        try:
+            close_val = float(latest_close) if latest_close is not None else None
+        except (ValueError, TypeError):
+            close_val = None
+
+        # 含み損益の事前計算（プロンプトに添える）
+        if close_val is not None and avg_cost > 0 and shares > 0:
+            pnl_pct = (close_val - avg_cost) / avg_cost * 100
+            pnl_yen = (close_val - avg_cost) * shares
+            pnl_summary = (
+                f"含み損益: {pnl_pct:+.2f}% / 概算 {pnl_yen:+,.0f}円"
+            )
+        else:
+            pnl_summary = "含み損益: 計算不能（株価または平均取得単価が未取得）"
+
+        holdings_text = (
+            holdings_context if (holdings_context or "").strip()
+            else "（このポジションのみ）"
+        )
+        overview_text = (
+            market_overview.summary if market_overview
+            else "（市場概況情報なし）"
+        )
+
+        prompt = (
+            "あなたは日本株のスイングトレード向けアナリストです。\n"
+            "以下は **ユーザーが既に保有している銘柄** です。\n"
+            "Web検索で直近のニュース・IR・決算情報を収集し、保有継続 / 売却 / 買い増しを\n"
+            "**明確に**判断してください。\n\n"
+
+            "--- ユーザー前提（必ず遵守） ---\n"
+            "・初期種銭は10万円（堅実運用で段階的に増資する方針）\n"
+            "・SBI証券のS株（単元未満株）、スイングトレード（数日〜数週間保有）の初心者\n"
+            "・短期で大きく稼ぐより **負けないこと** を優先する設計\n"
+            "・※ 株価が現在予算で買い増しできるか否かは判断に **影響させない**\n\n"
+
+            "--- 投資判断の制約条件（必ず守ること） ---\n"
+            "**制約1: 決算前後の判断**\n"
+            "   Web検索で次回決算発表予定日を確認。±3営業日以内なら ADD は出さず、\n"
+            "   保有継続（HOLD）を基本とする。決算前リスク回避としての SELL は許可。\n\n"
+            "**制約2: 短期イベントドリブン判断の禁止**\n"
+            "   「決算サプライズ期待」「ギャップアップ狙い」「材料出尽くし反発期待」を\n"
+            "   主要根拠とする ADD / SELL は出さない。\n\n"
+            "**制約3: リスク要因の重み付け**\n"
+            "   - 「高バリュエーション」「PER過熱」「テクニカル調整懸念」が明確な場合は\n"
+            "     SELL を優先検討（リスク顕在化の前に手仕舞う発想）\n"
+            "   - 下値硬直 + 好材料が出ていれば ADD 候補\n"
+            "   - 迷ったら HOLD（負けないこと優先）\n\n"
+            "**制約4: 保有銘柄全体の分散**\n"
+            f"   現在の保有銘柄全体: {holdings_text}\n"
+            "   同業種への ADD は集中リスクになるため、ADD 推奨時はリスク欄に明記する。\n\n"
+
+            "--- 保有ポジション情報 ---\n"
+            f"銘柄コード:    {code}\n"
+            f"会社名:        {name}\n"
+            f"保有株数:      {shares} 株\n"
+            f"平均取得単価:  {avg_cost:,.0f} 円\n"
+            f"現在値:        {close_val if close_val is not None else 'N/A'} 円\n"
+            f"{pnl_summary}\n\n"
+
+            "--- 市場概況 ---\n"
+            f"{overview_text}\n\n"
+
+            "--- 出力形式（必ずこの構造で返答） ---\n"
+            "## 推奨\n"
+            "[hold / sell / add のいずれか1語] ※ buy は出力しないこと（既に保有しているため）\n\n"
+            "## 根拠\n"
+            "- 箇条書きで3〜5点。含み損益・テクニカル・ファンダ・市場環境を踏まえる。\n"
+            "- 上記の制約1〜4を踏まえた判断であることが分かる記載にすること。\n\n"
+            "## リスク要因\n"
+            "- 箇条書きで2〜4点。\n"
+        )
+
+        result = self._client.ask_with_web_search(
+            prompt,
+            heavy=True,
+            max_searches=3,
+            max_tokens=4096,
+        )
+        raw = result["text"]
+
+        return StockAnalysis(
+            code=code,
+            name=name,
+            recommendation=self._extract_recommendation(raw, allowed=("hold", "sell", "add")),
+            reasoning=self._extract_section(raw, "根拠"),
+            risks=self._extract_bullets(self._extract_section(raw, "リスク要因")),
+            raw_text=raw,
+            citations=result["citations"],
+        )
+
+    def analyze_held_positions_throttled(
+        self,
+        holdings: list[dict[str, Any]],
+        market_overview: MarketOverview | None = None,
+        sleep_between_seconds: float = 60.0,
+        holdings_context: str | None = None,
+    ) -> Iterator[tuple[dict[str, Any], "StockAnalysis | None", "Exception | None"]]:
+        """保有ポジションを順次判断するスロットリング付きジェネレータ。
+
+        analyze_stocks_throttled の保有銘柄版。analyze_held_position を呼ぶ点だけ違う。
+        各呼び出しの **後** に sleep_between_seconds 秒スリープ（最後の1件後はスキップ）。
+
+        Yields:
+            (holding, analysis, error) の tuple。失敗時は (holding, None, Exception)。
+        """
+        n = len(holdings)
+        for i, h in enumerate(holdings):
+            try:
+                analysis = self.analyze_held_position(
+                    h,
+                    market_overview=market_overview,
+                    holdings_context=holdings_context,
+                )
+                yield (h, analysis, None)
+            except Exception as e:
+                yield (h, None, e)
+
+            is_last = (i == n - 1)
+            if not is_last and sleep_between_seconds > 0:
+                logger.info(
+                    f"レート制限回避: 次の保有判断まで {sleep_between_seconds:.0f}秒待機中…"
+                )
+                time.sleep(sleep_between_seconds)
 
     def analyze_stocks_throttled(
         self,
@@ -346,19 +499,38 @@ class AIAnalyzer:
             return None
 
     @staticmethod
-    def _extract_recommendation(text: str) -> str:
-        """`## 推奨` 以下から buy/sell/hold を抽出。"""
+    def _extract_recommendation(
+        text: str,
+        allowed: tuple[str, ...] = ("buy", "sell", "hold"),
+    ) -> str:
+        """`## 推奨` 以下から allowed のいずれかのラベルを抽出。
+
+        allowed の順序が優先順位（先頭ほど優先）。マッチしない場合は最後の要素
+        （通常 "hold"）にフォールバック = 慎重側に倒す。
+
+        Args:
+            text: モデル応答全文。
+            allowed: 抽出を許可するラベルのタプル。
+                未保有候補 → ("buy", "hold")
+                保有判断   → ("hold", "sell", "add")
+        """
         m = re.search(r"##\s*推奨\s*\n+\s*(\w+)", text)
         if m:
             token = m.group(1).lower()
-            for key in ("buy", "sell", "hold"):
+            # 完全一致を優先
+            if token in allowed:
+                return token
+            # 部分一致フォールバック（互換維持）
+            for key in allowed:
                 if key in token:
                     return key
-        # フォールバック：テキスト全体から最初に出る語を採用
-        for key in ("buy", "sell", "hold"):
-            if re.search(rf"\b{key}\b", text, re.IGNORECASE):
+        # 全文フォールバック：本文中で最初にヒットした allowed 語
+        for key in allowed:
+            if re.search(rf"\b{re.escape(key)}\b", text, re.IGNORECASE):
                 return key
-        return "hold"
+        # 最終フォールバック：仕様書「負けないこと優先」に沿って常に hold。
+        # allowed に hold が含まれない場合（想定外）は allowed の先頭を返す。
+        return "hold" if "hold" in allowed else allowed[0]
 
     @staticmethod
     def _extract_section(text: str, heading: str) -> str:
