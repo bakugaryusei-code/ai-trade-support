@@ -117,6 +117,7 @@ _last_batch = db.get_latest_batch_datetime()
 c1, c2 = st.columns(2)
 c1.caption(f"最終バッチ: {_last_batch or '—'}")
 c2.caption("🪙 J-Quants: Light / 当日データ")
+st.caption("📅 AI判断は **平日朝8時** に1回更新されます")
 
 
 # ─────────────────────────────────────────
@@ -159,7 +160,7 @@ with tab_reco:
         st.info(
             "本日の **BUY 推奨はありません**。\n\n"
             "AI が「今日積極的に買うべき銘柄」と判断したものはありませんでした。"
-            "次のバッチ（昼12時 / 夕方15時）をお待ちください。"
+            "次回バッチ（翌平日朝8時）をお待ちください。"
         )
 
     for rec in recs:
@@ -243,7 +244,7 @@ with tab_hold:
                     )
                 else:
                     st.caption(
-                        "AI判断: 次回バッチで生成されます（朝・昼・夕に更新）"
+                        "AI判断: 次回バッチで生成されます（平日朝8時に更新）"
                     )
 
 

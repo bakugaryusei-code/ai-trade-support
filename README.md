@@ -6,7 +6,7 @@
 
 - 10万円元手でSBI証券のS株（単元未満株）を使ったスイングトレード
 - AIが情報収集・分析・売買推奨を自動実行（Claude API）
-- ユーザーは1日3回スマホで確認し、SBIアプリから手動注文
+- ユーザーは1日1回（平日朝）スマホで確認し、SBIアプリから手動注文
 - 東証プライム市場の TOPIX 500 構成銘柄（Core30 + Large70 + Mid400）から候補銘柄を抽出、時価総額500億円以上・黒字企業に絞り込み
 
 ## 技術スタック
@@ -16,14 +16,14 @@
 - **SQLite**（データ永続化）
 - **J-Quants API**（株価・財務データ）
 - **Claude API**（分析・推奨生成）
-- **GitHub Actions**（1日3回のバッチ実行）
+- **GitHub Actions**（平日朝1回のバッチ実行）
 - **Streamlit Community Cloud**（ホスティング）
 
 ## アーキテクチャ
 
 ```
 [GitHub Actions]          [GitHub Repo]         [Streamlit Cloud]
-  ↓ 1日3回起動              ↑ SQLite commit       ↑ コード読込
+  ↓ 平日朝1回起動           ↑ Supabase 書き込み    ↑ コード読込
   J-Quants取得              ↑                     ↑
   Claude分析                ↑                     ↓ URL発行
   SQLite更新 ───────────────┘                     ↓

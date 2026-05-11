@@ -163,9 +163,9 @@ def save_recommendation(rec: dict[str, Any]) -> int:
 def get_latest_batch_datetime() -> str | None:
     """recommendations テーブルから最新の batch_datetime を返す（軽量1行クエリ）。
 
-    アプリのヘッダー「最終バッチ」表示用。市場概況は朝のみ更新だが、
-    recommendations は朝・昼・夕の3バッチすべてで更新されるため、
-    こちらを参照する方が「直近のデータ更新時刻」として正確。
+    アプリのヘッダー「最終バッチ」表示用。1日1回（平日朝8時）のバッチで
+    更新される recommendations を参照する。市場概況も同じバッチで更新される
+    が、recommendations の方がレコード数が多くインデックス効率がよい。
 
     Returns:
         "YYYY-MM-DD HH:MM" 形式の文字列。未投入時は None。

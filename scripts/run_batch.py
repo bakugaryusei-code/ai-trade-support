@@ -1,15 +1,20 @@
 """GitHub Actions / cron-job.org から呼び出されるバッチ起動スクリプト。
 
-JST 8時/12時/15時に定期実行され、以下を行う：
-  1. Pythonスクリーニング（少数候補に絞る）
-  2. 市場概況スキャン（Sonnet + Web検索、前回から4時間以上経過時のみ更新）
+**JST 平日朝8時のみ** に定期実行され、以下を行う：
+  1. Pythonスクリーニング（TOPIX 500 × 時価総額500億+黒字）
+  2. 市場概況スキャン（Sonnet + Web検索）
   3. Haikuバッチ評価で Tier 分類
-  4. Sonnet詳細分析（Tier A 上位3件を対象）
-  5. 結果を Supabase（PostgreSQL）に保存
+  4. Sonnet詳細分析（Tier A 上位3件を対象、未保有銘柄向け BUY/HOLD 判断）
+  5. 保有銘柄の HOLD/SELL/ADD 判断（保有0件時はスキップ）
+  6. 結果を Supabase（PostgreSQL）に保存
      ※ Phase 2 で SQLite から Supabase に移行済み。trade.db の commit/push は廃止。
 
-コスト目安：1回あたり $0.15〜0.30（月 $15〜27）
-J-Quants Light プラン（60/分）使用。Free 時代の対応で候補数は少なめに制限。
+実行頻度を1日1回（朝のみ）に絞った経緯:
+  - スイングトレード（数日〜数週間保有）は1日1回の判断で十分
+  - Claude API のコスト最適化（旧 3回/日 → 1回/日 = 月コスト約 67%削減）
+
+コスト目安：保有0件で $0.4〜0.7/回（月 $8〜14）、保有3件で $1.0〜1.3/回
+J-Quants Light プラン（60/分）使用。
 """
 from __future__ import annotations
 
