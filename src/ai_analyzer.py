@@ -12,11 +12,79 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from src.claude_client import ClaudeClient
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────
+# 日付ヘルパー（プロンプトへの注入用）
+# ─────────────────────────────────────────
+_JST = timezone(timedelta(hours=9))
+_WEEKDAY_JP = ("月", "火", "水", "木", "金", "土", "日")
+
+
+def _today_jst_str() -> str:
+    """JST の今日を「YYYY-MM-DD（曜日）」形式で返す。
+
+    Claude の training cutoff から推測した日付が実日付とズレるのを防ぐため、
+    すべての分析プロンプトに今日の日付を明示する。
+    """
+    now = datetime.now(_JST)
+    return f"{now.year}-{now.month:02d}-{now.day:02d}（{_WEEKDAY_JP[now.weekday()]}曜日）"
+
+
+# ─────────────────────────────────────────
+# 自己矛盾検出（## 推奨 と ## 根拠 の不整合を補正）
+# ─────────────────────────────────────────
+# Claude が「## 推奨: buy」と出しつつ ## 根拠 で「強制HOLD降格」と明記する
+# 自己矛盾ケースを検出するキーワード（小文字化テキストに対してマッチ）。
+_HOLD_OVERRIDE_KEYWORDS = (
+    "強制hold",
+    "強制ホールド",
+    "強制 hold",
+    "hold に降格",
+    "holdに降格",
+    "hold へ降格",
+    "holdへ降格",
+    "holdへ強制",
+    "buy → hold",
+    "buy->hold",
+    "制約1に抵触",
+    "制約1抵触",
+    "制約1違反",
+    "制約2に抵触",
+    "制約2抵触",
+    "制約2違反",
+    "制約3に抵触",
+    "制約3抵触",
+    "制約3違反",
+    "制約4に抵触",
+    "制約4抵触",
+    "制約4違反",
+    "決算ギャンブル",
+)
+
+
+def _detect_self_contradiction(reasoning: str, risks: list[str]) -> str | None:
+    """根拠/リスク本文から HOLD 降格を示唆するキーワードを検出し、最初のマッチを返す。
+
+    スペース・全半角矢印のゆらぎを吸収するため、テキストとキーワードを
+    両方とも空白除去 + 小文字化してから照合する。
+
+    Returns:
+        マッチしたキーワード（matched signal）、なければ None。
+    """
+    parts: list[str] = [reasoning] if isinstance(reasoning, str) else list(reasoning or [])
+    if risks:
+        parts.extend(str(r) for r in risks)
+    combined = " ".join(parts).lower().replace(" ", "")
+    for kw in _HOLD_OVERRIDE_KEYWORDS:
+        if kw.lower().replace(" ", "") in combined:
+            return kw
+    return None
 
 
 # ─────────────────────────────────────────
@@ -72,17 +140,25 @@ class AIAnalyzer:
     def run_market_overview(self) -> MarketOverview:
         """日経平均・TOPIX・セクター動向・マクロイベントを Web検索で要約。
 
-        朝のルーティンで1回だけ実行する想定（1日3バッチのうち朝のみ）。
+        朝のバッチで1回だけ実行する想定（1日1回運用）。
         コスト: 約 $0.05。
         """
+        today = _today_jst_str()
         prompt = (
-            "あなたは日本株のスイングトレード向け市場アナリストです。\n"
-            "今日の日本株式市場について、Web検索で最新情報を調べ、以下の観点で要約してください：\n\n"
+            "あなたは日本株のスイングトレード向け市場アナリストです。\n\n"
+            "--- 現在日時（必ずこの日付を起点に判断すること） ---\n"
+            f"本日: **{today}**（日本標準時 JST）\n"
+            "※ この日付を冒頭で必ず明記し、Web検索結果が古い日付の場合は\n"
+            "  「最新の」「直近の」と再検索して鮮度を担保すること。\n\n"
+            "--- タスク ---\n"
+            "上記の本日時点における日本株式市場について、Web検索で最新情報を調べ、\n"
+            "以下の観点で要約してください：\n\n"
             "1. **主要指数**: 日経平均・TOPIX・NT倍率の値と前日比\n"
             "2. **上昇セクター / 下落セクター**: 具体的に業種名と背景\n"
             "3. **注目材料**: 企業決算・政策・地政学リスクなど、翌日以降の相場に影響しそうな3点\n"
             "4. **明日の注目ポイント**: スイングトレーダーが留意すべき1〜2点\n\n"
-            "400〜600字程度。数値と事実は最新の実データに基づくこと。"
+            f"400〜600字程度。日付は冒頭で「{today}」と明記すること。\n"
+            "数値と事実は最新の実データに基づくこと。"
         )
         result = self._client.ask_with_web_search(
             prompt,
@@ -202,10 +278,16 @@ class AIAnalyzer:
         holdings_text = holdings_context if (holdings_context or "").strip() else "（現在保有なし）"
         latest_close = stock.get("latest_close")
 
+        today = _today_jst_str()
         prompt = (
             "あなたは日本株のスイングトレード向けアナリストです。\n"
             "以下の銘柄について、Web検索で直近のニュース・IR・決算情報を収集し、"
             "投資判断を**明確に**推奨してください。\n\n"
+
+            "--- 現在日時（必ずこの日付を起点に判断すること） ---\n"
+            f"本日: **{today}**（日本標準時 JST）\n"
+            "※ Claude の事前学習日付ではなく、上記日付を真の「本日」として扱うこと。\n"
+            "※ 「±3営業日」等の日付計算は必ず上記日付を起点に行うこと。\n\n"
 
             "--- ユーザー前提（必ず遵守） ---\n"
             "・初期種銭は **10万円**（堅実運用できれば段階的に増資する方針）\n"
@@ -216,11 +298,13 @@ class AIAnalyzer:
             "  予算判定は表示側で別マーカーとして扱うため、純粋な投資メリットで\n"
             "  BUY / SELL / HOLD を出すこと。\n\n"
 
-            "--- 投資判断の制約条件（必ず守ること） ---\n"
-            "**制約1: 決算前後の BUY 禁止**\n"
+            "--- 投資判断の制約条件（必ず守ること、違反は無効判断扱い） ---\n"
+            "**制約1: 決算前後の BUY 禁止【最重要】**\n"
             "   Web検索で **次回** 決算発表予定日を必ず確認し、本日から ±3営業日\n"
-            "   以内に発表予定なら BUY ではなく **HOLD** とする（決算ギャンブル防止）。\n"
-            "   次回決算日が分からない場合も慎重側に倒し、HOLD 寄りで判断する。\n\n"
+            "   以内に発表予定なら BUY を **絶対に出さず**、必ず **HOLD** とすること。\n"
+            "   次回決算日が分からない場合も慎重側に倒し、HOLD とする。\n"
+            "   ※ ## 根拠 に「強制HOLD」「制約1抵触」「決算前のため HOLD」等を\n"
+            "     書いた場合、## 推奨 は必ず HOLD とすること（自己矛盾は絶対禁止）。\n\n"
             "**制約2: 短期イベントドリブン BUY の禁止**\n"
             "   以下を **主要根拠** とした BUY は出さない（補助的な言及はOK）:\n"
             "   - 「決算サプライズ期待」「ギャップアップ狙い」\n"
@@ -250,7 +334,9 @@ class AIAnalyzer:
 
             "--- 出力形式（必ずこの構造で返答） ---\n"
             "## 推奨\n"
-            "[buy / hold のいずれか1語] ※ sell は出力しないこと（未保有銘柄のため意味がない）\n\n"
+            "[buy / hold のいずれか1語] ※ sell は出力しないこと（未保有銘柄のため意味がない）\n"
+            "※ ## 根拠 や ## リスク要因 で「強制HOLD」「制約抵触」と書く場合は、\n"
+            "  上の1語は必ず hold とすること（書きながら buy を出す自己矛盾は絶対禁止）。\n\n"
             "## 根拠\n"
             "- 箇条書きで3〜5点、具体的な事実・数値・ニュースを引用\n"
             "- 上記の制約1〜4を踏まえた判断であることが分かる記載にすること\n\n"
@@ -266,7 +352,7 @@ class AIAnalyzer:
         )
         raw = result["text"]
 
-        return StockAnalysis(
+        analysis = StockAnalysis(
             code=stock.get("code", ""),
             name=stock.get("name", ""),
             recommendation=self._extract_recommendation(raw, allowed=("buy", "hold")),
@@ -275,6 +361,24 @@ class AIAnalyzer:
             raw_text=raw,
             citations=result["citations"],
         )
+
+        # ─── 自己矛盾の安全網: ## 推奨 = buy だが根拠で「強制HOLD」等が明記された
+        #     場合、HOLD に降格する。Claude のラベル/根拠不整合を検出した最終チェック。
+        if analysis.recommendation == "buy":
+            matched_kw = _detect_self_contradiction(analysis.reasoning, analysis.risks)
+            if matched_kw:
+                logger.warning(
+                    f"自己矛盾検出: {analysis.code} の ## 推奨=buy だが根拠に "
+                    f"'{matched_kw}' を検出 → HOLD に降格"
+                )
+                analysis.recommendation = "hold"
+                analysis.risks.insert(
+                    0,
+                    f"AIの根拠内で「{matched_kw}」相当の記述が検出されたため、"
+                    "推奨ラベルを BUY → HOLD に統一（自己矛盾自動補正）"
+                )
+
+        return analysis
 
     # ─── Step 4: 保有銘柄の継続/売却/買い増し判断 ───────────
 
@@ -328,11 +432,17 @@ class AIAnalyzer:
             else "（市場概況情報なし）"
         )
 
+        today = _today_jst_str()
         prompt = (
             "あなたは日本株のスイングトレード向けアナリストです。\n"
             "以下は **ユーザーが既に保有している銘柄** です。\n"
             "Web検索で直近のニュース・IR・決算情報を収集し、保有継続 / 売却 / 買い増しを\n"
             "**明確に**判断してください。\n\n"
+
+            "--- 現在日時（必ずこの日付を起点に判断すること） ---\n"
+            f"本日: **{today}**（日本標準時 JST）\n"
+            "※ Claude の事前学習日付ではなく、上記日付を真の「本日」として扱うこと。\n"
+            "※ 「±3営業日」等の日付計算は必ず上記日付を起点に行うこと。\n\n"
 
             "--- ユーザー前提（必ず遵守） ---\n"
             "・初期種銭は10万円（堅実運用で段階的に増資する方針）\n"
@@ -385,7 +495,7 @@ class AIAnalyzer:
         )
         raw = result["text"]
 
-        return StockAnalysis(
+        analysis = StockAnalysis(
             code=code,
             name=name,
             recommendation=self._extract_recommendation(raw, allowed=("hold", "sell", "add")),
@@ -394,6 +504,24 @@ class AIAnalyzer:
             raw_text=raw,
             citations=result["citations"],
         )
+
+        # ─── 保有判断の自己矛盾安全網: ## 推奨 = add だが根拠で「制約抵触/強制HOLD」
+        #     等が明記されたら HOLD に降格。SELL はリスク回避として有効なので対象外。
+        if analysis.recommendation == "add":
+            matched_kw = _detect_self_contradiction(analysis.reasoning, analysis.risks)
+            if matched_kw:
+                logger.warning(
+                    f"自己矛盾検出: {analysis.code} の ## 推奨=add だが根拠に "
+                    f"'{matched_kw}' を検出 → HOLD に降格"
+                )
+                analysis.recommendation = "hold"
+                analysis.risks.insert(
+                    0,
+                    f"AIの根拠内で「{matched_kw}」相当の記述が検出されたため、"
+                    "推奨ラベルを ADD → HOLD に統一（自己矛盾自動補正）"
+                )
+
+        return analysis
 
     def analyze_held_positions_throttled(
         self,
