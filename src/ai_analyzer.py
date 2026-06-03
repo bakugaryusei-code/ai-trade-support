@@ -42,6 +42,7 @@ def _today_jst_str() -> str:
 # Claude が「## 推奨: buy」と出しつつ ## 根拠 で「強制HOLD降格」と明記する
 # 自己矛盾ケースを検出するキーワード（小文字化テキストに対してマッチ）。
 _HOLD_OVERRIDE_KEYWORDS = (
+    # 降格・強制系
     "強制hold",
     "強制ホールド",
     "強制 hold",
@@ -52,6 +53,7 @@ _HOLD_OVERRIDE_KEYWORDS = (
     "holdへ強制",
     "buy → hold",
     "buy->hold",
+    # 制約抵触系
     "制約1に抵触",
     "制約1抵触",
     "制約1違反",
@@ -65,6 +67,27 @@ _HOLD_OVERRIDE_KEYWORDS = (
     "制約4抵触",
     "制約4違反",
     "決算ギャンブル",
+    # ─── 2026-06-03 追加: 「結論は HOLD」を別の言い回しで書くケース ───
+    # （大和ハウス誤BUY の根拠に実際に現れた表現を網羅）
+    "holdとする",
+    "holdと判断",
+    "holdが妥当",
+    "holdが適切",
+    "holdを推奨",
+    "様子見とする",
+    "様子見が妥当",
+    "buy根拠を形成しない",
+    "買い根拠を形成しない",
+    "buyの根拠を形成しない",
+    "buyに満たない",
+    "buyには満たない",
+    "buyを見送",
+    "買いを見送",
+    "buyではなく",
+    "買いではなく",
+    "buyせず",
+    "buyしない",
+    "両方肯定的な場合のみbuy",  # 「…のみBUYに満たない」文脈の前半を拾う
 )
 
 
@@ -632,10 +655,21 @@ class AIAnalyzer:
         text: str,
         allowed: tuple[str, ...] = ("buy", "sell", "hold"),
     ) -> str:
-        """`## 推奨` 以下から allowed のいずれかのラベルを抽出。
+        """`## 推奨` **セクション本文** から allowed のラベルを抽出。
 
-        allowed の順序が優先順位（先頭ほど優先）。マッチしない場合は最後の要素
-        （通常 "hold"）にフォールバック = 慎重側に倒す。
+        【重要な設計判断（2026-06-03 不具合修正）】
+        旧実装は「## 推奨 ヘッダ直後の1単語」を取り、失敗時は **本文全体から
+        最初の buy/hold を拾う** フォールバックを持っていた。これが
+        「## 推奨：HOLD」「**HOLD（様子見）**」のような記号・コロン付き出力で
+        ヘッダ抽出に失敗し、根拠中の否定文脈（"BUY 根拠を形成しない" 等）の
+        BUY を誤って拾って buy を返す不具合を起こしていた。
+
+        新実装の方針:
+          1. `## 推奨` セクション本文（次の `##` 見出しまで）のみを判定対象にする
+             → 根拠・リスク欄の否定文脈 BUY を構造的に見ない
+          2. セクション本文に hold があれば最優先で hold（負けないこと優先）
+          3. 本文全体スキャンのフォールバックは **廃止**
+          4. 判定不能なら hold（allowed に hold が無ければ先頭）
 
         Args:
             text: モデル応答全文。
@@ -643,22 +677,23 @@ class AIAnalyzer:
                 未保有候補 → ("buy", "hold")
                 保有判断   → ("hold", "sell", "add")
         """
-        m = re.search(r"##\s*推奨\s*\n+\s*(\w+)", text)
-        if m:
-            token = m.group(1).lower()
-            # 完全一致を優先
-            if token in allowed:
-                return token
-            # 部分一致フォールバック（互換維持）
+        # ## 推奨 セクション本文を抽出（コロン「：/:」・改行・記号「**」のゆらぎに強い）。
+        # 次の `##` 見出し or 文末まで。これにより根拠/リスク欄は判定対象に含まれない。
+        m = re.search(r"##\s*推奨[\s:：]*(.*?)(?=\n##|\Z)", text, re.DOTALL)
+        section = (m.group(1) if m else "").lower()
+
+        if section.strip():
+            # 保守優先: 推奨欄に hold があれば hold（"** HOLD **" 等の記号付きも \b で拾う）
+            if "hold" in allowed and re.search(r"\bhold\b", section):
+                return "hold"
+            # それ以外は allowed の優先順位（先頭優先）で最初にマッチした語
             for key in allowed:
-                if key in token:
+                if re.search(rf"\b{re.escape(key)}\b", section):
                     return key
-        # 全文フォールバック：本文中で最初にヒットした allowed 語
-        for key in allowed:
-            if re.search(rf"\b{re.escape(key)}\b", text, re.IGNORECASE):
-                return key
-        # 最終フォールバック：仕様書「負けないこと優先」に沿って常に hold。
-        # allowed に hold が含まれない場合（想定外）は allowed の先頭を返す。
+
+        # 推奨セクションが取れない / 判定語なし → hold（負けないこと優先）。
+        # ※ 旧実装の「本文全体から最初の buy を拾う」フォールバックは、根拠中の
+        #   否定文脈 BUY を誤検出する事故の元だったため廃止した。
         return "hold" if "hold" in allowed else allowed[0]
 
     @staticmethod
